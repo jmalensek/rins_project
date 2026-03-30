@@ -348,8 +348,8 @@ def main(args = None):
     #print(waypoints)
     re.cover_environment(waypoints)
 
-    while(True):
-        re.get_logger().info(f"{re.finished_count} /finished=True triggers received. Waiting for 2 to stop exploration.")
+    #while(True):
+    #   re.get_logger().info(f"{re.finished_count} /finished=True triggers received. Waiting for 2 to stop exploration.")
 
     re.destroy_node()
     rclpy.shutdown()
