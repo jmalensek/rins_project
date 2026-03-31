@@ -52,6 +52,7 @@ class RobotExplorer(Node):
 
         # Publishers
         self.cmd_vel_pub = self.create_publisher(TwistStamped, 'cmd_vel', 10)
+        self.finished_pub = self.create_publisher(Bool, "/finished", 10)
 
         # Subscribers
         self.create_subscription(LaserScan, 'scan_filtered', self._scanCallback, qos_profile_sensor_data)
@@ -186,10 +187,11 @@ class RobotExplorer(Node):
             else:
                 self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
 
-            # Check if 2 finished signal received
+            # Check if 2 finished signal received, terminate exploration, and publish signal
             if self.finished_count >= 2:
-                self.get_logger().info("Received /finished=True trigger twice, stopping exploration.")
-                break
+                self.get_logger().info("Received /finished=True trigger twice, stopping exploration, publishing /finished=True trigger.")
+                self.finished_pub.publish(Bool(data=True))
+                return
         
     # NAVIGATION HELPER METHODS
     def get_waypoints_from_map(self, step: float = 1.0) -> list[tuple[float, float]]:
@@ -347,10 +349,7 @@ def main(args = None):
     #waypoints = re.get_waypoints_from_map(step=1.0)
     #print(waypoints)
     re.cover_environment(waypoints)
-
-    #while(True):
-    #   re.get_logger().info(f"{re.finished_count} /finished=True triggers received. Waiting for 2 to stop exploration.")
-
+    re.get_logger().info("Exploration complete, shutting down.")
     re.destroy_node()
     rclpy.shutdown()
 
