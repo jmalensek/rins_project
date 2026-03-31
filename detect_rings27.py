@@ -320,7 +320,7 @@ class detect_rings(Node):
 
             marker.header.frame_id = "map"
 
-            marker.type = 2
+            marker.type = 2  # could change
             marker.id = i  # unique id per ring
 
             cx, cy, cz = cluster["centroid"]
@@ -361,6 +361,8 @@ class detect_rings(Node):
                 self.get_logger().info(f"Detected 2 rings with colors: {', '.join(self.detected_colors)}. Publishing finished signal.")
                 self.finished_pub.publish(Bool(data=True))
                 self.get_logger().info("Done. Published /finished=True. Shutting down node.")
+
+                # Optionally, stop further processing or exit
                 rclpy.shutdown()
     def detect_ring_color(self, cv_image, cx, cy, r):
         h_img, w_img = cv_image.shape[:2]
