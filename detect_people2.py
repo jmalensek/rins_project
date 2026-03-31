@@ -177,12 +177,12 @@ class detect_faces(Node):
 		if self.coords_published: return
 		if len(self.detections) < 3:
 			return
-		if any(len(self.detections[person_id]) < 5 for person_id in range(3)):
+		if any(len(self.detections[person_id]) < 2 for person_id in range(3)):
 			return
 		self.coords_published = True
 
 		for person_id in range(3):
-			person_detections = np.array(self.detections[person_id], dtype=float)
+			person_detections = np.array(self.detections[2 - person_id], dtype=float)
 			x, y, z = np.mean(person_detections, axis=0)
 
 			msg = PoseStamped()
