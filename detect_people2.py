@@ -51,12 +51,10 @@ class detect_faces(Node):
 		self.detections = []    # [person_id][x,y,z]  2D array
 		self.coords_published = False
 		self.face_t = 0.7
-		
 
 		# subscribe to image + pointcloud
 		self.rgb_image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.rgb_callback, qos_profile_sensor_data)
 		self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
-
 
 		self.model = YOLO("yolov8n.pt") # for people detection
 		self.faces = []
@@ -230,6 +228,7 @@ class detect_faces(Node):
 
 			# read center coordinates in base_link frame
 			d = a[y, x, :]
+			#d[2] *= 0.75
 
 			point_stamped = PointStamped()
 			point_stamped.header.frame_id = "base_link"
@@ -245,6 +244,23 @@ class detect_faces(Node):
 			x = float(point_map.point.x)
 			y = float(point_map.point.y)
 			z = float(point_map.point.z)
+
+			# artificially move closer to robot
+			robot_x = transform.transform.translation.x
+			robot_y = transform.transform.translation.y
+			robot_z = transform.transform.translation.z
+			dx = x - robot_x
+			dy = y - robot_y
+			dz = z - robot_z
+
+			#offset = 0.2  # meters
+			dist = np.sqrt(dx**2 + dy**2 + dz**2)
+			if dist > 0:
+				#factor = (dist - offset) / dist
+				factor = 0.9   
+				x = robot_x + dx * factor
+				y = robot_y + dy * factor
+				z = robot_z + dz * factor
 
 			self.match_person(x, y, z)
 
