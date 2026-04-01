@@ -86,7 +86,7 @@ class detect_rings(Node):
             gray = cv2.GaussianBlur(gray, (9, 9), 1)
 
             # detectinh ONLY on upper third :)
-            upper_h = gray.shape[0] // 3
+            upper_h = gray.shape[0] // 2
             gray_upper = gray[:upper_h, :]
 
             cv2.imshow("gray", gray_upper)
@@ -275,7 +275,7 @@ class detect_rings(Node):
                 cluster["count"] += 1
                 cluster["last_seen"] = now_sec
 
-                if cluster["count"] == 5 and not cluster.get("spoken", False):
+                if cluster["count"] == 3 and not cluster.get("spoken", False):
                     name = (cluster.get("color") or {}).get("name", "unknown")
                     
                     self.say(f"{name} ring")
@@ -476,7 +476,11 @@ def main():
     node = detect_rings()
     rclpy.spin(node)
     node.destroy_node()
-    rclpy.shutdown()
+        
+    try:    
+        rclpy.shutdown()
+    except Exception as e:
+        print(f"Error during shutdown: {e}")
 
 if __name__ == '__main__':
     main()
