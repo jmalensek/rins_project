@@ -172,8 +172,12 @@ class RobotExplorer(Node):
             return False
 
         self.result_future = self.goal_handle.get_result_async()
+        self.get_logger().info(f"Goal accepted, navigating to ({x:.2f}, {y:.2f})")
         return True
 
+    # NAVIGATION METHDOS
+
+    # Sequentially visits a set of waypoints on a provided map
     def cover_environment(self, waypoints: list[tuple[float, float]]):
         for x, y in waypoints:
             self.get_logger(). info(f"Navigating to waypoint ({x:.2f}, {y:.2f})")
@@ -192,6 +196,13 @@ class RobotExplorer(Node):
                 self.get_logger().info("Received /finished=True trigger twice, stopping exploration, publishing /finished=True trigger.")
                 self.finished_pub.publish(Bool(data=True))
                 return
+
+    # Simple routine to localise the robot on the map
+    def localise_self(self):
+        self.get_logger().info("Starting self-localization procedure...")
+
+        # Test spin 360
+        self.turn(2 *math.pi)
         
     # NAVIGATION HELPER METHODS
     def get_waypoints_from_map(self, step: float = 1.0) -> list[tuple[float, float]]:
@@ -327,13 +338,15 @@ def main(args = None):
         rclpy.shutdown()
         return
 
+    re.localise_self()
+    #re.go_to_pose(1.8396370262122645, -0.5751383533952286)
+
     # hardcoded waypoints for the specific map
-    waypoints = [(2.212346248653394, 0.009680876809087835),
+    waypoints = [(1.8396370262122645, -0.5751383533952286),
                 (2.1833755802533554, -1.9678722468643208),
                 (1.417301595011825, -2.666432722817975),
-                (1.289321485429959, -3.4529791198569413),
                 (0.12696714192880537, -3.6631788241089063),
-                (0.03727206723370793, -1.5493085954305073),
+                (0.017924597277648373, -0.9779664499620027),
                 (-0.011229038107887649,-2.3238756805248095),
                 (-1.0622132922149174, -2.411171268639826),
                 (-1.2901576432001445, -1.089920196088445),
@@ -346,9 +359,15 @@ def main(args = None):
                 (-2.4022780168470765, 2.4666737072366414),
                 (-2.6826873711016357, 0.7170108058401835)]
 
+    waypoints_irl = [(-1.7038028346169256, 0.2871813831218706), 
+                    (-1.8228687502144738, -0.3039300472226143),
+                    (-2.8083746751160654, -0.5383538880441935),
+                    (-2.9581028006218273, -0.8952083394225052),
+                    (-3.3163698668480146, -1.275044404810225)]
+
     #waypoints = re.get_waypoints_from_map(step=1.0)
     #print(waypoints)
-    re.cover_environment(waypoints)
+    re.cover_environment(waypoints_irl)
     re.get_logger().info("Exploration complete, shutting down.")
     re.destroy_node()
     rclpy.shutdown()
