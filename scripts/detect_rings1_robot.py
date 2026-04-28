@@ -227,28 +227,47 @@ class detect_rings(Node):
         self.get_logger().info(f"Ring {color['name'] if color else 'unknown'} at map coordinates: ({map_x:.2f}, {map_y:.2f})")
         self.add_to_clusters(map_x, map_y, map_z, color)
 
-    def _get_valid_depth(self, depth_dx, depth_dy, ring_radius, window_radius=6):
+    def _get_valid_depth(self, depth_dx, depth_dy, ring_radius, min_outer_radius=6):
         depth_h, depth_w = self.depth_image.shape[:2]
-        values = []
-        outer_radius = max(window_radius, int(1.1 * ring_radius))
+    
+        outer_radius = max(min_outer_radius, int(1.1 * ring_radius))
         inner_radius = max(2, int(0.45 * ring_radius))
-
-        for row in range(max(0, depth_dy - outer_radius), min(depth_h, depth_dy + outer_radius + 1)):
-            for col in range(max(0, depth_dx - outer_radius), min(depth_w, depth_dx + outer_radius + 1)):
-                dist = np.hypot(col - depth_dx, row - depth_dy)
-                if dist < inner_radius or dist > outer_radius:
-                    continue
-                depth_value = float(self.depth_image[row, col])
-                if not np.isfinite(depth_value) or depth_value <= 0.0:
-                    continue
-                if depth_value > 20.0:
-                    depth_value /= 1000.0
-                values.append(depth_value)
-
-        if not values:
+    
+        # Bounding box clamped to image bounds
+        y0 = max(0, depth_dy - outer_radius)
+        y1 = min(depth_h, depth_dy + outer_radius + 1)
+        x0 = max(0, depth_dx - outer_radius)
+        x1 = min(depth_w, depth_dx + outer_radius + 1)
+    
+        # Vectorised annulus mask
+        rows, cols = np.ogrid[y0:y1, x0:x1]
+        dist = np.hypot(cols - depth_dx, rows - depth_dy)
+        annulus = (dist >= inner_radius) & (dist <= outer_radius)
+    
+        # Extract values inside annulus
+        patch = self.depth_image[y0:y1, x0:x1].astype(float)
+        values = patch[annulus]
+    
+        # Filter invalid values
+        valid = np.isfinite(values) & (values > 0.0)
+        values = values[valid]
+    
+        if values.size == 0:
             return None
-
-        return float(np.median(values))
+    
+        # Convert mm → m (do this after filtering so units are consistent)
+        values = np.where(values > 20.0, values / 1000.0, values)
+    
+        # Trimmed mean between 5th and 95th percentile for stability
+        lo, hi = np.percentile(values, [5, 95])
+        trimmed = values[(values >= lo) & (values <= hi)]
+        result = float(np.mean(trimmed)) if trimmed.size > 0 else float(np.median(values))
+    
+        # Sanity clamp — reject physically implausible depths
+        if not (0.1 <= result <= 10.0):
+            return None
+    
+        return result
 
 
             
@@ -362,51 +381,87 @@ class detect_rings(Node):
             
     def detect_ring_color(self, cv_image, cx, cy, r):
         h_img, w_img = cv_image.shape[:2]
-
-        x0 = max(0, int(cx - r))
-        x1 = min(w_img, int(cx + r) + 1)
-        y0 = max(0, int(cy - r))
-        y1 = min(h_img, int(cy + r) + 1)
-
-        roi = cv_image[y0:y1, x0:x1]
-        if roi.size == 0:
+    
+        # Annulus bounds — same logic as depth sampling
+        outer_radius = int(1.05 * r)
+        inner_radius = max(2, int(0.45 * r))
+    
+        x0 = max(0, int(cx - outer_radius))
+        x1 = min(w_img, int(cx + outer_radius) + 1)
+        y0 = max(0, int(cy - outer_radius))
+        y1 = min(h_img, int(cy + outer_radius) + 1)
+    
+        if x1 <= x0 or y1 <= y0:
             return None
-
+    
+        # Build annulus mask
+        rows, cols = np.ogrid[y0:y1, x0:x1]
+        dist = np.hypot(cols - cx, rows - cy)
+        annulus_mask = (dist >= inner_radius) & (dist <= outer_radius)  # shape: (patch_h, patch_w)
+    
+        # Optionally filter by depth consistency —
+        # pixels on the ring rim should all be at roughly the same depth
+        if self.depth_image is not None:
+            depth_patch = self.depth_image[y0:y1, x0:x1].astype(float)
+    
+            # Convert mm → m where needed
+            depth_patch = np.where(depth_patch > 20.0, depth_patch / 1000.0, depth_patch)
+    
+            # Only keep finite, plausible depth values inside annulus
+            depth_valid = np.isfinite(depth_patch) & (depth_patch > 0.1) & (depth_patch < 10.0)
+            annulus_depths = depth_patch[annulus_mask & depth_valid]
+    
+            if annulus_depths.size > 5:
+                # Estimate ring depth as median of annulus depths
+                ring_depth = np.median(annulus_depths)
+    
+                # Keep only pixels whose depth is within a tight tolerance of the ring plane
+                tolerance = max(0.05, 0.10 * ring_depth)  # 10% of distance, min 5cm
+                depth_consistent = np.abs(depth_patch - ring_depth) < tolerance
+                annulus_mask = annulus_mask & depth_valid & depth_consistent
+    
+        # Extract color patch and convert to LAB
+        roi = cv_image[y0:y1, x0:x1]
         img_float = roi.astype(np.float32) / 255.0
-        lab_roi = cv2.cvtColor(img_float, cv2.COLOR_BGR2Lab)
-        pixels = lab_roi.reshape(-1, 3)
-
+        lab_patch = cv2.cvtColor(img_float, cv2.COLOR_BGR2Lab)
+    
+        # Apply annulus mask to get only ring pixels
+        pixels = lab_patch[annulus_mask]  # shape: (N, 3)
+    
         if pixels.shape[0] < 20:
             return None
-
+    
+        # Classify each pixel
         labels = [self.classify_lab(L, A, B) for L, A, B in pixels]
+    
+        # Count votes for valid ring colors only
+        ring_colors = {"red", "green", "blue", "black", "yellow", "white"}
         counts = {}
         for label in labels:
-            counts[label] = counts.get(label, 0) + 1
-
-        # Filter to only ring colors: red, green, blue, black
-        ring_colors = {"red", "green", "blue", "black", "yellow", "white"}
-        ring_counts = {color: counts.get(color, 0) for color in ring_colors}
-
-        # Select the most common ring color
-        if not ring_counts or max(ring_counts.values()) == 0:
+            if label in ring_colors:
+                counts[label] = counts.get(label, 0) + 1
+    
+        if not counts or max(counts.values()) == 0:
             return None
-
-        selected_name = max(ring_counts, key=ring_counts.get)
-
-        # Get the median LAB for the selected color
-        class_pixels = np.array([pix for pix, label in zip(pixels, labels) if label == selected_name])
+    
+        # Pick the dominant color
+        selected_name = max(counts, key=counts.get)
+    
+        # Median LAB of pixels that voted for the winning color
+        class_pixels = np.array([
+            pix for pix, label in zip(pixels, labels) if label == selected_name
+        ])
+    
         if class_pixels.size == 0:
             return None
-
+    
         selected_lab = np.median(class_pixels, axis=0)
-
+    
         return {
             "lab": selected_lab.tolist(),
             "name": selected_name
         }
-
-
+    
     def classify_lab(self, L, A, B):
         """
         Classify a LAB color as one of: red, green, blue, black, white, yellow.
