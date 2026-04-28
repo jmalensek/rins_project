@@ -385,7 +385,7 @@ class detect_rings(Node):
             counts[label] = counts.get(label, 0) + 1
 
         # Filter to only ring colors: red, green, blue, black
-        ring_colors = {"red", "green", "blue", "black"}
+        ring_colors = {"red", "green", "blue", "black", "yellow", "white"}
         ring_counts = {color: counts.get(color, 0) for color in ring_colors}
 
         # Select the most common ring color
@@ -408,26 +408,35 @@ class detect_rings(Node):
 
 
     def classify_lab(self, L, A, B):
-        # Simplified classification for only blue, green, red, and black rings
+        """
+        Classify a LAB color as one of: red, green, blue, black, white, yellow.
+        """
         chroma = np.sqrt(A ** 2 + B ** 2)
-
-        # self.get_logger().info(f"Classifying color with L={L:.1f}, A={A:.1f}, B={B:.1f}, chroma={chroma:.1f}")
-
-        if chroma < 5:
-            # Achromatic — only classify as black if very dark
-            if L < 20:
+    
+        # --- Achromatic colors (low chroma) ---
+        if chroma < 15:
+            if L < 25:
                 return "black"
+            elif L > 75:
+                return "white"
             else:
                 return "unknown"
-
-        # Chromatic — hue angle in LAB (atan2 of B over A)
+    
+        # --- Chromatic colors — use hue angle ---
         hue = np.degrees(np.arctan2(B, A)) % 360
 
-        if hue < 15 or hue >= 345:
+        if hue < 22 or hue >= 330:
             return "red"
-        elif hue >= 75 and hue < 150:
+        elif 22 <= hue < 75:
+            return "yellow"
+        elif 75 <= hue < 165:
+            # Extra guard: true green has positive B, blue has negative B
+            if B > 0 and A < 10:
+                return "green"
+            elif B <= 5:
+                return "blue"   # shifted blue caught in green range
             return "green"
-        elif hue >= 150 and hue < 255:
+        elif 165 <= hue < 260:
             return "blue"
         else:
             return "unknown"
