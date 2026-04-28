@@ -24,6 +24,9 @@ from std_msgs.msg import Bool, String
 
 class detect_rings(Node):
 
+
+    
+
     def __init__(self):
         super().__init__('detect_rings')
 
@@ -34,6 +37,14 @@ class detect_rings(Node):
         ])
 
         marker_topic = "/rings_marker"
+
+
+            # Define these as class constants or pull from params
+        self.MAP_X_MIN, self.MAP_X_MAX = -3.0, 1.0
+        self.MAP_Y_MIN, self.MAP_Y_MAX = -3.0, 0.5
+        self.MAP_Z_MIN, self.MAP_Z_MAX =  0.0, 1.5  # z=0 is floor, z=2 is ceiling
+        self.MIN_DEPTH = 0.1   # metres — closer than this is almost certainly noise
+        self.MAX_DEPTH = 3.1  # metres — further than this is unreliable
 
         self.detection_color = (0,0,255)  # question about that
         self.device = self.get_parameter('device').get_parameter_value().string_value
@@ -269,26 +280,19 @@ class detect_rings(Node):
     
         return result
 
-    # Define these as class constants or pull from params
-    MAP_X_MIN, MAP_X_MAX = -5.0, 5.0
-    MAP_Y_MIN, MAP_Y_MAX = -5.0, 5.0
-    MAP_Z_MIN, MAP_Z_MAX =  0.0, 2.0  # z=0 is floor, z=2 is ceiling
-    MIN_DEPTH = 0.1   # metres — closer than this is almost certainly noise
-    MAX_DEPTH = 10.0  # metres — further than this is unreliable
-    
     def _is_valid_position(self, cx, cy, cz):
         """Return True if the centroid is within plausible map and depth bounds."""
-        if not (MAP_X_MIN <= cx <= MAP_X_MAX):
+        if not (self.MAP_X_MIN <= cx <= self.MAP_X_MAX):
             self.get_logger().warn(f"Centroid x={cx:.2f} out of map bounds, skipping.")
             return False
-        if not (MAP_Y_MIN <= cy <= MAP_Y_MAX):
+        if not (self.MAP_Y_MIN <= cy <= self.MAP_Y_MAX):
             self.get_logger().warn(f"Centroid y={cy:.2f} out of map bounds, skipping.")
             return False
-        if not (MAP_Z_MIN <= cz <= MAP_Z_MAX):
+        if not (self.MAP_Z_MIN <= cz <= self.MAP_Z_MAX):
             self.get_logger().warn(f"Centroid z={cz:.2f} out of map bounds, skipping.")
             return False
         depth = np.sqrt(cx**2 + cy**2 + cz**2)
-        if not (MIN_DEPTH <= depth <= MAX_DEPTH):
+        if not (self.MIN_DEPTH <= depth <= self.MAX_DEPTH):
             self.get_logger().warn(f"Centroid depth={depth:.2f}m out of valid range, skipping.")
             return False
         return True
@@ -394,7 +398,7 @@ class detect_rings(Node):
             if name not in self.detected_colors:
                 self.detected_colors.add(name)
     
-            if len(self.detected_colors) >= 4:  # was 10, but you said 4 rings
+            if len(self.detected_colors) >= 10:  # was 10, but you said 4 rings
                 self.get_logger().info(
                     f"Detected 4 rings with colors: {', '.join(self.detected_colors)}. "
                     f"Publishing finished signal."
