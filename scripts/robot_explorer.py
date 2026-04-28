@@ -180,11 +180,9 @@ class RobotExplorer(Node):
             # Compute the yaw angle to face at the next waypoint
             yaw = 0.0
             if index < len(waypoints) - 1:
-                next_x, next_y = waypoints[index + 1]
-                yaw = math.atan2(next_y - y, next_x - x)
+                yaw = self.compute_absolute_yaw((x, y), waypoints[index + 1])
             elif index > 0:
-                prev_x, prev_y = waypoints[index - 1]
-                yaw = math.atan2(y - prev_y, x - prev_x)
+                yaw = self.compute_absolute_yaw(waypoints[index - 1], (x, y))
 
             self.get_logger(). info(f"Navigating to waypoint ({x:.2f}, {y:.2f}) with yaw {yaw:.2f} rad")
 
@@ -218,6 +216,30 @@ class RobotExplorer(Node):
             self.rotate(turns, angular_speed, wait_time)
         
     # NAVIGATION HELPER METHODS
+
+    # Computes the yaw between two absolute poses
+    def compute_absolute_yaw(self, from_pose: tuple[float, float], to_pose: tuple[float, float]) -> float:
+        from_x, from_y = from_pose
+        to_x, to_y = to_pose
+        return math.atan2(to_y - from_y, to_x - from_x)
+    
+    # Compute the relative yaw to a target pose relative to the current robot pose
+    # The coordinates of the target pose are relative, i.e. current pose is (0,0)
+    def compute_relative_yaw(self, target_pose: tuple[float, float]) -> float:
+        target_x, target_y = target_pose
+        return math.atan2(target_y, target_x)
+    
+    # Computes the distance between two poses
+    def compute_distance(self, pose1: tuple[float, float], pose2: tuple[float, float]) -> float:
+        x1, y1 = pose1
+        x2, y2 = pose2
+        return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+    
+    # Computes the distance to a relative target pose
+    # The coordinates of the target pose are relative, i.e. current pose is (0,0)
+    def compute_relative_distance(self, target_pose: tuple[float, float]) -> float:
+        target_x, target_y = target_pose
+        return math.sqrt(target_x ** 2 + target_y ** 2)
 
     # Checks whether amcl pose is stable an the robot is well-localised
     def is_localised(self, pos_threshold: float = 0.2, yaw_threshold: float = 0.2, min_streak: int = 3) -> bool:
@@ -341,6 +363,14 @@ class RobotExplorer(Node):
                     cancel_future = self.goal_handle.cancel_goal_async()
                     rclpy.spin_until_future_complete(self, cancel_future)
                 return False
+        return False
+    
+    # Cancels the current navigation goal
+    def cancel_task(self) -> bool:
+        if self.goal_handle is not None:
+            cancel_future = self.goal_handle.cancel_goal_async()
+            rclpy.spin_until_future_complete(self, cancel_future)
+            return cancel_future.result().return_code == GoalStatus.STATUS_SUCCEEDED
         return False
 
     # Helper method to convert map cell indices to world coordinates (center of the cell)
