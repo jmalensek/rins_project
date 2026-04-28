@@ -71,7 +71,7 @@ class detect_rings(Node):
         self.ring_clusters = []
         self.cluster_threshold = 0.50  # 50 centimers
 
-        self.min_detections = 25  # min hits before publishing a marker
+        self.min_detections = 10  # min hits before publishing a marker
 
         self.ema_alpha = 0.1  # EMA smoothing factor for centroid
 
@@ -106,7 +106,7 @@ class detect_rings(Node):
             upper_h = gray.shape[0] // 2
             gray_upper = gray[:upper_h, :]
 
-            cv2.imshow("gray", gray_upper)
+            # cv2.imshow("gray", gray_upper)
             key = cv2.waitKey(1)
             if key == 27:
                 print("exiting")
