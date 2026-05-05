@@ -36,6 +36,15 @@ class PeopleRecognizer:
         except Exception as e:
             print(f"Ni mogoče zaznati obraza: {e}")
             return None
+    
+        # Gender analiza
+        analyze_result = DeepFace.analyze(
+            img_path=image,
+            actions=["gender"],
+            enforce_detection=False
+        )
+        
+        gender = analyze_result[0]["dominant_gender"]  # 'Man' ali 'Woman'
 
         # Cosine distance do vseh v bazi
         distances = np.array([
@@ -51,7 +60,7 @@ class PeopleRecognizer:
         
         return {
             "name":       self.names[best_idx],
-            "gender":     self.genders[best_idx],
+            "gender":     gender,
             "job":        self.jobs[best_idx],
             "confidence": round(1 - best_dist, 3)
         }
