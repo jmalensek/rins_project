@@ -35,6 +35,9 @@ install(PROGRAMS
   scripts/detect_rings27.py
   scripts/greet_people.py
   scripts/greet_people_faster.py
+  scripts/cylinder_detection.py
+  scripts/recognize_people_2s.py
+  scripts/greet_people_2s.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
