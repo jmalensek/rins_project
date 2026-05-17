@@ -1,0 +1,58 @@
+{
+  "Anita": {
+    "gender": "female",
+    "job": "quality inspector"
+  },
+  "Anna": {
+    "gender": "female",
+    "job": "visitor"
+  },
+  "David": {
+    "gender": "male",
+    "job": "welder"
+  },
+  "Elena": {
+    "gender": "female",
+    "job": "forklift driver"
+  },
+  "Felix": {
+    "gender": "male",
+    "job": "belt technician"
+  },
+  "Fred": {
+    "gender": "male",
+    "job": "visitor"
+  },
+  "Jeff": {
+    "gender": "male",
+    "job": "cto"
+  },
+  "Laura": {
+    "gender": "female",
+    "job": "middle manager"
+  },
+  "Luka": {
+    "gender": "male",
+    "job": "accountant"
+  },
+  "Maria": {
+    "gender": "female",
+    "job": "delivery driver"
+  },
+  "Robert": {
+    "gender": "male",
+    "job": "line painter"
+  },
+  "Sara": {
+    "gender": "female",
+    "job": "inventory manager"
+  },
+  "Sofia": {
+    "gender": "female",
+    "job": "laser calibrator"
+  },
+  "Victor": {
+    "gender": "male",
+    "job": "plc programmer"
+  }
+}

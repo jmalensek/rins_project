@@ -12,7 +12,7 @@ import subprocess
 
 from cv_bridge import CvBridge, CvBridgeError
 from robot_commander import RobotCommander
-from recognize_people_2s import PeopleRecognizer
+from scripts.RECOGNIZE_PEOPLE_2s import PeopleRecognizer
 
 
 class greet_people(Node):
