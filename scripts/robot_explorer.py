@@ -24,6 +24,10 @@ from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from rclpy.qos import qos_profile_sensor_data
 
+import numpy as np
+import cv2
+from sensor_msgs.msg import Image
+
 map_qos = QoSProfile(
     durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
     reliability=QoSReliabilityPolicy.RELIABLE,
@@ -52,6 +56,14 @@ class RobotExplorer(Node):
         self._amcl_window = deque()
         self.localisation_streak = 0
 
+        self._last_bgr = None
+
+        image_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
@@ -64,6 +76,7 @@ class RobotExplorer(Node):
         self.create_subscription(OccupancyGrid, 'map', self._map_callback, map_qos)
         self.create_subscription(Bool, '/finished', self._finished_callback, 10)
         self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._amcl_pose_callback, 10)
+        self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self._image_callback, image_qos)
 
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
 
@@ -174,7 +187,7 @@ class RobotExplorer(Node):
     # NAVIGATION METHODS
 
     # Sequentially visits a set of waypoints on a provided map
-    def cover_waypoints(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0) -> None:
+    def cover_waypoints(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0, localise: bool = True) -> None:
         for index, (x, y) in enumerate(waypoints):
 
             # Compute the yaw angle to face at the next waypoint
@@ -187,7 +200,8 @@ class RobotExplorer(Node):
             self.get_logger(). info(f"Navigating to waypoint ({x:.2f}, {y:.2f}) with yaw {yaw:.2f} rad")
 
             # Rotate to help with localisation
-            self.rotate(turns, angular_speed, wait_time)
+            if localise:
+                self.rotate(turns, angular_speed, wait_time)
 
             # Compute the yaw for the next
 
@@ -195,7 +209,7 @@ class RobotExplorer(Node):
                 self.get_logger().error(f"Failed to send goal to ({x:.2f}, {y:.2f})")
                 continue
             
-            if not self.wait_task_done(timeout_sec=360.0):
+            if not self.wait_task_done(timeout_sec=10.0):
                 self.get_logger().error(f"Failed to reach ({x:.2f}, {y:.2f}) within timeout")
             else:
                 self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
@@ -214,8 +228,147 @@ class RobotExplorer(Node):
             self.get_logger().info("Robot localising...")
 
             self.rotate(turns, angular_speed, wait_time)
-        
+
+    # Follows a blue line on the ground
+    # The line possibly branches out, so the robot should follow the leftmost branch
+    # and return when the line ends
+    def follow_blue_line(
+        self,
+        linear_speed: float = 0.2,
+        max_angular_speed: float = 0.5,
+        k_p: float = 0.004,
+        min_area: int = 500,
+        lost_timeout_sec: float = 5.0,
+        loop_dt: float = 0.1,
+        ) -> None:
+        self.get_logger().info("Starting to follow the blue line...")
+
+        uturn_attempts = 0
+        max_uturn_attempts = 2
+
+        lower_blue = np.array([95, 80, 40], dtype=np.uint8)
+        upper_blue = np.array([140, 255, 255], dtype=np.uint8)
+
+        kernel = np.ones((5, 5), np.uint8)
+
+        def publish_cmd(v: float, w: float) -> None:
+            msg = TwistStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "base_link"
+            msg.twist.linear.x = float(v)
+            msg.twist.angular.z = float(w)
+            self.cmd_vel_pub.publish(msg)
+
+        start_time = self.get_clock().now()
+        while rclpy.ok() and self._last_bgr is None:
+            if (self.get_clock().now() - start_time).nanoseconds * 1e-9 > 2.0:
+                self.get_logger().warn("No camera image received; cannot follow line.")
+                return
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        lost_time = 0.0
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.0)
+
+            img = self._last_bgr
+            if img is None:
+                time.sleep(loop_dt)
+                continue
+
+            h, w, _ = img.shape
+            y0 = int(h * 0.3)
+            roi = img[y0:h, :]
+
+            img_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(img_hsv, lower_blue, upper_blue)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = [c for c in contours if cv2.contourArea(c) >= min_area]
+
+            if not contours:
+                lost_time += loop_dt
+                publish_cmd(0.0, 0.0)
+
+                if lost_time >= lost_timeout_sec:
+                    if uturn_attempts < max_uturn_attempts:
+                        self.get_logger().info("Line lost; turning around to continue following.")
+                        for _ in range(3):
+                            publish_cmd(0.0, 0.0)
+                            time.sleep(0.05)
+
+                        self.turn(math.pi, angular_speed=max(0.2, max_angular_speed))
+                        uturn_attempts += 1
+                        lost_time = 0.0
+                        time.sleep(loop_dt)
+                        continue
+
+                    for _ in range(3):
+                        publish_cmd(0.0, 0.0)
+                        time.sleep(0.05)
+                    self.get_logger().info("Line lost; giving up after repeated turnarounds.")
+                    return
+
+                time.sleep(loop_dt)
+                continue
+
+            lost_time = 0.0
+            uturn_attempts = 0
+            best = None
+            best_cx = None
+
+            for c in contours:
+                M = cv2.moments(c)
+                if M['m00'] == 0:
+                    continue
+                cx = int(M['m10'] / M['m00'])
+                if best is None or cx < best_cx:
+                    best = c
+                    best_cx = cx
+
+            if best is None:
+                lost_time += loop_dt
+                publish_cmd(0.0, 0.0)
+                time.sleep(loop_dt)
+                continue
+
+            target_x = float(best_cx)
+            center_x = float(w) / 2.0
+            error_px = target_x - center_x
+
+            angular = -k_p * error_px
+            angular = max(-max_angular_speed, min(max_angular_speed, angular))
+
+            speed_scale = max(0.3, 1.0 - abs(angular) / max_angular_speed)
+            v = linear_speed * speed_scale
+
+            publish_cmd(v, angular)
+            time.sleep(loop_dt)
+
     # NAVIGATION HELPER METHODS
+
+    # Makes a grid of points using two opposing corner bounds
+    def generate_grid(self, corner1: tuple[float, float], corner2: tuple[float, float], step: float = 0.5) -> list[tuple[float,float]]:
+        x1, y1 = corner1
+        x2, y2 = corner2
+
+        min_x = min(x1, x2)
+        max_x = max(x1, x2)
+        min_y = min(y1, y2)
+        max_y = max(y1, y2)
+
+        grid_points = []
+        y = min_y
+        while y <= max_y:
+            x = min_x
+            while x <= max_x:
+                grid_points.append((x, y))
+                x += step
+            y += step
+
+        return grid_points
 
     # Computes the yaw between two absolute poses
     def compute_absolute_yaw(self, from_pose: tuple[float, float], to_pose: tuple[float, float]) -> float:
@@ -397,6 +550,52 @@ class RobotExplorer(Node):
         if len(self._amcl_window) > 20:
             self._amcl_window.popleft()
 
+    def _image_callback(self, msg: Image) -> None:
+        try:
+            encoding = (msg.encoding or "").lower()
+
+            if encoding in ("bgr8", "rgb8"):
+                channels = 3
+            elif encoding in ("mono8", "8uc1"):
+                channels = 1
+            else:
+                self.get_logger().warn(f"Unsupported image encoding: {msg.encoding}")
+                return
+
+            row_stride = int(msg.step)
+            if row_stride <= 0:
+                self.get_logger().warn("Image step/stride is invalid")
+                return
+
+            expected_row_bytes = int(msg.width) * channels
+            buf = np.frombuffer(msg.data, dtype=np.uint8)
+
+            if buf.size < int(msg.height) * row_stride:
+                self.get_logger().warn("Image buffer is smaller than expected")
+                return
+
+            if row_stride == expected_row_bytes:
+                if channels == 3:
+                    img = buf[: int(msg.height) * expected_row_bytes].reshape((msg.height, msg.width, 3))
+                else:
+                    img = buf[: int(msg.height) * expected_row_bytes].reshape((msg.height, msg.width))
+            else:
+                rows = buf[: int(msg.height) * row_stride].reshape((msg.height, row_stride))
+                rows = rows[:, :expected_row_bytes]
+                if channels == 3:
+                    img = rows.reshape((msg.height, msg.width, 3))
+                else:
+                    img = rows.reshape((msg.height, msg.width))
+
+            if encoding == "rgb8":
+                img = img[:, :, ::-1]
+            elif channels == 1:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+            self._last_bgr = img
+        except Exception as e:
+            self.get_logger().warn(f"Failed to convert image without cv_bridge: {e}")
+
 def main(args = None):
 
     rclpy.init(args=args)
@@ -413,6 +612,10 @@ def main(args = None):
     #re.localise_self()
 
     # hardcoded waypoints for the specific map
+    area1_lower_left_bound = (-4.50756475184462, 0.0182652945804538)
+    area1_upper_right_bound = (0.7969508957012219, -4.426747521850663)
+    blue_line_start = (2.797641390882936, 0.19569027139125528)
+
     waypoints_task1_sim = [(1.8396370262122645, -0.5751383533952286),
                 (2.1833755802533554, -1.9678722468643208),
                 (1.417301595011825, -2.666432722817975),
@@ -436,12 +639,10 @@ def main(args = None):
                     (-2.9581028006218273, -0.8952083394225052),
                     (-3.3163698668480146, -1.275044404810225)]
 
-    area1_lower_left_bound = (-4.50756475184462, 0.0182652945804538)
-    area1_upper_right_bound = (0.7969508957012219, -4.426747521850663)
-    blue_line_start = (2.797641390882936, 0.19569027139125528)
+    waypoints_task2_sim_area1 = re.generate_grid(area1_lower_left_bound, area1_upper_right_bound, step=0.2)
 
-    #re.rotate(turns=4, angular_speed=0.5, wait_time=1.0)
-    re.cover_waypoints(waypoints_irl)
+    #re.cover_waypoints(waypoints_task2_sim_area1, localise=False)
+    re.follow_blue_line()
     re.get_logger().info("Exploration complete, shutting down.")
     re.destroy_node()
     rclpy.shutdown()
