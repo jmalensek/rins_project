@@ -198,12 +198,25 @@ class detect_barrels(Node):
 
         if self.latest_rgb is None:
             return
-
-        gen = pc2.read_points(data, field_names=("x", "y", "z"), skip_nans=True)
-
-        pts_camera = np.array(list(gen), dtype=np.float32)
-
-        if pts_camera.shape[0] < 50:
+        gen = pc2.read_points(
+            data,
+            field_names=("x", "y", "z"),
+            skip_nans=True
+        )
+        
+        pts_list = []
+        
+        for p in gen:
+        
+            x = float(p[0])
+            y = float(p[1])
+            z = float(p[2])
+        
+            if np.isfinite(x) and np.isfinite(y) and np.isfinite(z):
+        
+                pts_list.append([x, y, z])
+        
+        if len(pts_list) < 50:
             return
 
         pts_map = self._transform_points_to_map(pts_camera, data.header)
@@ -397,7 +410,7 @@ class detect_barrels(Node):
 
             pcd.points = o3d.utility.Vector3dVector(pts)
 
-            labels = np.array(pcd.cluster_dbscan(eps=0.08, min_points=60))
+            labels = np.asarray(pcd.cluster_dbscan(eps=0.08, min_points=60))
 
             cylinders = []
 
@@ -410,9 +423,9 @@ class detect_barrels(Node):
                 if len(indices) < 80:
                     continue
 
-                cluster_pts = pts[indices]
+                cluster_pts = np.asarray(pts[indices], dtype=np.float32)
 
-                centroid = cluster_pts.mean(axis=0)
+                centroid = np.mean(cluster_pts, axis=0)
 
                 cov = np.cov(cluster_pts.T)
 
