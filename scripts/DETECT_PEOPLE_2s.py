@@ -25,7 +25,7 @@ from geometry_msgs.msg import PoseStamped
 
 from std_msgs.msg import String
 
-from .RECOGNIZE_PEOPLE_2s import PeopleRecognizer
+from RECOGNIZE_PEOPLE_2s import PeopleRecognizer
 from robot_commander import RobotCommander
 
 MODEL_PATH = "yolo26n-face.pt"
@@ -47,7 +47,8 @@ class detect_faces(Node):
 		self.detection_color = (0,0,255)
 		self.device = self.get_parameter('device').get_parameter_value().string_value
 		self.standoff_distance = 0.65
-		self.min_attempt_interval_s = 2.0
+		self.min_attempt_interval_s = 0.5
+		self.merge_radius_m = 0.5
 
 		self.bridge = CvBridge()
 
@@ -59,15 +60,16 @@ class detect_faces(Node):
 		self.latest_image = None
 		self.faces = []  # list of dicts: {cx, cy, bbox}
 
-		self.visited_names = set()
-		self.people = {}  # name -> {gender, job}
+		# tracked locations (map frame):
+		# {"x": float, "y": float, "samples": [(name, gender), ...], "done": bool}
+		self.tracks = []
 
 		# Notify other nodes (e.g., QR scanning) when we have arrived at a person
 		self.current_person_pub = self.create_publisher(String, "/current_person", 10)
 
 		self._last_attempt_time = 0.0
 		self._pending_goal = None
-		self._pending_name = None
+		self._pending_track = None
 		self._navigating = False
 
 		try:
@@ -124,11 +126,34 @@ class detect_faces(Node):
 			cv2.imshow("image", cv_image)
 			key = cv2.waitKey(1)
 			if key==27:
-				print("exiting")
-				exit()
+				self.get_logger().info("Exiting (ESC pressed)")
+				rclpy.shutdown()
+				return
+
 			
 		except CvBridgeError as e:
 			print(e)
+
+
+	def _find_track_ix(self, x_map: float, y_map: float):
+		for i, t in enumerate(self.tracks):
+			dx = float(t["x"]) - float(x_map)
+			dy = float(t["y"]) - float(y_map)
+			if (dx * dx + dy * dy) <= (self.merge_radius_m * self.merge_radius_m):
+				return i
+		return None
+
+	def _majority_name_gender(self, samples):
+		counts = {}
+		for name, gender in samples:
+			if not name:
+				continue
+			key = (name, gender or "?")
+			counts[key] = counts.get(key, 0) + 1
+		if not counts:
+			return None, "?"
+		(name, gender), _ = max(counts.items(), key=lambda kv: kv[1])
+		return name, gender
 
 
 	def _crop_bbox(self, image: np.ndarray, bbox):
@@ -143,8 +168,10 @@ class detect_faces(Node):
 		return image[y1:y2, x1:x2].copy()
 
 
-	def _queue_navigation(self, name: str, x_map: float, y_map: float):
+	def _queue_navigation(self, track_ix: int, x_map: float, y_map: float):
 		if self._pending_goal is not None or self._navigating:
+			return
+		if track_ix is None:
 			return
 		if not getattr(self.rc, "initial_pose_received", True) or getattr(self.rc, "current_pose", None) is None:
 			self.get_logger().warn("Robot pose not available yet (waiting for amcl_pose)")
@@ -177,8 +204,8 @@ class detect_faces(Node):
 		goal.pose.orientation = self.rc.YawToQuaternion(float(yaw))
 
 		self._pending_goal = goal
-		self._pending_name = name
-		self.get_logger().info(f"Queued navigation to {name} at ({goal_x:.2f}, {goal_y:.2f})")
+		self._pending_track = int(track_ix)
+		self.get_logger().info(f"Queued navigation to track#{track_ix} at ({goal_x:.2f}, {goal_y:.2f})")
 
 
 	def process_pending(self):
@@ -186,20 +213,28 @@ class detect_faces(Node):
 			return
 		if self._navigating:
 			if self.rc.isTaskComplete():
-				arrived_name = self._pending_name
-				gender = self.people.get(arrived_name, {}).get("gender", "?") if arrived_name else "?"
-				msg = String()
-				msg.data = json.dumps({"person": arrived_name, "gender": gender})
-				self.current_person_pub.publish(msg)
-				self.get_logger().info(f"Arrived to {arrived_name}. Notified /current_person (gender={gender}).")
+				track_ix = self._pending_track
+				name = None
+				gender = "?"
+				if track_ix is not None and 0 <= int(track_ix) < len(self.tracks):
+					track = self.tracks[int(track_ix)]
+					name, gender = self._majority_name_gender(track.get("samples", []))
+					track["done"] = True
+				if name:
+					msg = String()
+					msg.data = json.dumps({"person": name, "gender": gender})
+					self.current_person_pub.publish(msg)
+					self.get_logger().info(f"Arrived. Majority person={name} gender={gender}. Published /current_person.")
+				else:
+					self.get_logger().warn("Arrived, but no recognition samples to publish.")
 				self._navigating = False
 				self._pending_goal = None
-				self._pending_name = None
+				self._pending_track = None
 			return
 
 		# start navigation
 		self._navigating = True
-		self.get_logger().info(f"Going to {self._pending_name}...")
+		self.get_logger().info(f"Going to track#{self._pending_track}...")
 		self.rc.goToPose(self._pending_goal)
 
 
@@ -235,19 +270,7 @@ class detect_faces(Node):
 			if crop is None:
 				continue
 
-			result = self.recognizer.recognize(crop)
-			if not result:
-				continue
-			name = result.get("name", "Unknown")
-			if name == "Unknown":
-				# Skip depth + TF work for unknown people
-				self.get_logger().info(f"Unknown face (dist={result.get('distance')}, conf={result.get('confidence')})")
-				continue
-			if name in self.visited_names:
-				continue
-
-			# Only now (known + new name) do depth lookup + TF to map
-			# read center coordinates in pointcloud frame
+			# depth lookup + TF to map (needed for location tracking)
 			d = a[y, x, :]
 			if not np.isfinite(d[0]) or not np.isfinite(d[1]) or not np.isfinite(d[2]):
 				continue
@@ -267,15 +290,22 @@ class detect_faces(Node):
 			x1 = float(point_map.point.x)
 			y1 = float(point_map.point.y)
 
-			self.visited_names.add(name)
-			self.people[name] = {
-				"gender": result.get("gender"),
-				"job": result.get("job"),
-			}
-			self.get_logger().info(
-				f"Recognized {name} ({self.people[name]['gender']}, {self.people[name]['job']})"
-			)
-			self._queue_navigation(name, x1, y1)
+			track_ix = self._find_track_ix(x1, y1)
+			if track_ix is not None and self.tracks[track_ix].get("done"):
+				continue
+			if track_ix is None:
+				self.tracks.append({"x": x1, "y": y1, "samples": [], "done": False})
+				track_ix = len(self.tracks) - 1
+				self._queue_navigation(track_ix, x1, y1)
+
+			result = self.recognizer.recognize(crop)
+			if result is None:
+				continue
+			name = result.get("name")
+			gender = result.get("gender")
+			if not name:
+				continue
+			self.tracks[track_ix]["samples"].append((name, gender))
 
 
 

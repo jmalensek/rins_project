@@ -29,6 +29,8 @@ install(DIRECTORY
 
 install(PROGRAMS
   scripts/detect_people.py
+  scripts/DETECT_PEOPLE_2s.py
+  scripts/QR_NODE_2s.py
   scripts/robot_commander.py
   scripts/robot_explorer.py
   scripts/detect_people2.py
@@ -36,7 +38,7 @@ install(PROGRAMS
   scripts/greet_people.py
   scripts/greet_people_faster.py
   scripts/cylinder_detection.py
-  scripts/recognize_people_2s.py
+  scripts/RECOGNIZE_PEOPLE_2s.py
   scripts/greet_people_2s.py
   DESTINATION lib/${PROJECT_NAME})
 

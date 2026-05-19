@@ -25,7 +25,11 @@ UNKNOWN_MAX_COSINE_DISTANCE = 0.40  # 0.0 = enak, 1.0 = povsem drugačen
 
 
 class PeopleRecognizer:
-    def __init__(self, db_dir: str = "./embeddings_db", unknown_max_distance: float = UNKNOWN_MAX_COSINE_DISTANCE):
+    def __init__(
+        self,
+        db_dir: str = "./embeddings_db",
+        unknown_max_distance: float = UNKNOWN_MAX_COSINE_DISTANCE,
+    ):
         db = Path(db_dir)
         self.unknown_max_distance = float(unknown_max_distance)
 
@@ -70,7 +74,7 @@ class PeopleRecognizer:
         # nearest neighbor distance (cosine)
         min_dist = float(self.knn.kneighbors(emb_2d, n_neighbors=1)[0][0][0])
         if min_dist > self.unknown_max_distance:
-            return {"name": "Unknown", "gender": "?", "job": "?", "confidence": 0.0, "distance": round(min_dist, 3)}
+            return None
 
         # predict class + confidence
         confidence = None
@@ -88,13 +92,16 @@ class PeopleRecognizer:
             best_name = self.le.inverse_transform([class_id])[0]
             confidence = float(max(0.0, 1.0 - min_dist))
 
+        if not best_name:
+            return None
+
         # gender (best-effort)
         gender = "?"
         try:
             analyze_result = DeepFace.analyze(img_path=image, actions=["gender"], enforce_detection=False)
-            gender = analyze_result[0].get("dominant_gender", "?")
+            gender = analyze_result[0].get("dominant_gender")
         except Exception:
-            pass
+            return None
 
         meta = self.metadata.get(best_name, {})
 
@@ -107,6 +114,8 @@ class PeopleRecognizer:
         }
 
 
+# try on one picture
+# ros2 run pkg recognize_people_2s -- <image_path>"
 def main():
     parser = argparse.ArgumentParser(description="Run face recognition on a single image.")
     parser.add_argument("image", nargs="?", help="Path to an image file")

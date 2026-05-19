@@ -12,7 +12,7 @@ import subprocess
 
 from cv_bridge import CvBridge, CvBridgeError
 from robot_commander import RobotCommander
-from scripts.RECOGNIZE_PEOPLE_2s import PeopleRecognizer
+from RECOGNIZE_PEOPLE_2s import PeopleRecognizer
 
 
 class greet_people(Node):
@@ -165,7 +165,7 @@ class greet_people(Node):
             return
         
         try:
-            recognizer = PeopleRecognizer("embeddings.json")
+            recognizer = PeopleRecognizer("./embeddings_db")
             result = recognizer.recognize(self.latest_image)
             
             if result:
