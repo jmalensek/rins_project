@@ -14,14 +14,16 @@
 
 #include "geometry_msgs/msg/point_stamped.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/camera_info.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/msg/image.hpp"
 #include "tf2/convert.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 #include "visualization_msgs/msg/marker.hpp"
 
-#include <cv_bridge/cv_bridge.h>
+#include <cv_bridge/cv_bridge.hpp>
 #include <opencv2/opencv.hpp>
 #include <message_filters/subscriber.h>
 #include <message_filters/time_synchronizer.h>
@@ -86,10 +88,9 @@ ColorStats analyzeColors(const pcl::PointCloud<PointT>::Ptr& cloud) {
     int n = cloud->points.size();
     
     for (const auto& point : cloud->points) {
-        uint32_t rgb = *reinterpret_cast<int*>(&point.rgb);
-        sum_r += (rgb >> 16) & 0xFF;
-        sum_g += (rgb >> 8) & 0xFF;
-        sum_b += rgb & 0xFF;
+        sum_r += static_cast<float>(point.r);
+        sum_g += static_cast<float>(point.g);
+        sum_b += static_cast<float>(point.b);
     }
     
     stats.avg_r = sum_r / n;
