@@ -21,6 +21,23 @@
 #include "tf2_ros/transform_listener.h"
 #include "visualization_msgs/msg/marker.hpp"
 
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/opencv.hpp>
+#include <message_filters/subscriber.h>
+#include <message_filters/time_synchronizer.h>
+#include <map>
+#include <cmath>
+#include <algorithm>
+
+/*
+ZA DODAT:
+- ko detecta barrel, naredi color recognition
+- vse barelle shranjuje - se pravi njegov id, barvo, orientation, lokacija, ali leaka, ali je bil published?
+- to potem publisha na nek topic
+- za preverit kako se orientacijo zamenja - se pravi X ali Y axis
+
+*/
+
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr planes_pub;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cylinder_pub;
 rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub;
@@ -29,38 +46,104 @@ std::shared_ptr<rclcpp::Node> node;
 std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
 std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
 
-typedef pcl::PointXYZ PointT;
+typedef pcl::PointXYZRGB PointT;
+
+// Camera intrinsics
+float fx = 383.5f, fy = 383.5f;  // focal lengths (update based on camera_info)
+float cx = 320.0f, cy = 240.0f;  // principal point
+int image_width = 640, image_height = 480;
 
 // parameters
 float error_margin = 0.04;  // 4 cm margin for radius error
 float target_radius = 0.11; // 11cm radius
-bool verbose = false;
+bool verbose = false; // debug outout
 
 // cloud filtering
-float x_limit_low = 0;
+float x_limit_low = 0; // only process points 0-3m in X direction
 float x_limit_high = 3;
-float z_limit_low = -0.2;
+float z_limit_low = -0.2; // keep points between -0.2 ro 0.3m in Z
 float z_limit_high = 0.3;
 
 // RANSAC
 int ransac_max_iterations = 50;
-float ransac_normal_distance_weight = 0.3;
-float ransac_distance_threshold = 0.005;
+float ransac_normal_distance_weight = 0.3; // how much to trust normals
+float ransac_distance_threshold = 0.005; // 5mm inlier threshold
 
 float marker_height = 0.4;
 int max_detected_cylinders = 3;
 int min_cylinder_size = 500;
 
-void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+struct ColorStats {
+    float avg_r, avg_g, avg_b;
+    float std_r, std_g, std_b;
+};
+
+ColorStats analyzeColors(const pcl::PointCloud<PointT>::Ptr& cloud) {
+    ColorStats stats = {0, 0, 0, 0, 0, 0};
+    if (cloud->empty()) return stats;
+    
+    float sum_r = 0, sum_g = 0, sum_b = 0;
+    int n = cloud->points.size();
+    
+    for (const auto& point : cloud->points) {
+        uint32_t rgb = *reinterpret_cast<int*>(&point.rgb);
+        sum_r += (rgb >> 16) & 0xFF;
+        sum_g += (rgb >> 8) & 0xFF;
+        sum_b += rgb & 0xFF;
+    }
+    
+    stats.avg_r = sum_r / n;
+    stats.avg_g = sum_g / n;
+    stats.avg_b = sum_b / n;
+    return stats;
+}
+
+std::string identifyColor(const ColorStats& stats) {
+    float r = stats.avg_r, g = stats.avg_g, b = stats.avg_b;
+    float max_val = std::max({r, g, b});
+    if (max_val < 10) return "BLACK";
+    
+    r /= max_val; g /= max_val; b /= max_val;
+    
+    if (r > 0.7 && g < 0.3 && b < 0.3) return "RED";
+    if (g > 0.7 && r < 0.3 && b < 0.3) return "GREEN";
+    if (b > 0.7 && r < 0.3 && g < 0.3) return "BLUE";
+    if (r > 0.6 && g > 0.6 && b < 0.3) return "YELLOW";
+    return "OTHER";
+}
+
+void colorizePointCloud(pcl::PointCloud<PointT>::Ptr& cloud, const cv::Mat& rgb_image) {
+    for (auto& point : cloud->points) {
+        if (point.z <= 0) {
+            point.r = point.g = point.b = 0;
+            continue;
+        }
+        
+        int u = (int)(fx * point.x / point.z + cx);
+        int v = (int)(fy * point.y / point.z + cy);
+        
+        if (u >= 0 && u < image_width && v >= 0 && v < image_height) {
+            cv::Vec3b bgr = rgb_image.at<cv::Vec3b>(v, u);
+            point.r = bgr[2];  // BGR to RGB
+            point.g = bgr[1];
+            point.b = bgr[0];
+        } else {
+            point.r = point.g = point.b = 128;
+        }
+    }
+}
+
+// Pointcloud callback
+void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_msgs::msg::Image::SharedPtr image_msg) {
     // save timestamp from message
     rclcpp::Time now = (*msg).header.stamp;
 
     // set up PCL objects
-    pcl::PassThrough<PointT> pass;
-    pcl::NormalEstimation<PointT, pcl::Normal> ne;
-    pcl::SACSegmentationFromNormals<PointT, pcl::Normal> seg;
-    pcl::PCDWriter writer;
-    pcl::ExtractIndices<PointT> extract;
+    pcl::PassThrough<PointT> pass; // removes points outside bounds
+    pcl::NormalEstimation<PointT, pcl::Normal> ne; // calculates surface normals
+    pcl::SACSegmentationFromNormals<PointT, pcl::Normal> seg; // RANSAC cylinder finder
+    pcl::PCDWriter writer; 
+    pcl::ExtractIndices<PointT> extract; // extracts specific points from cloud
     pcl::ExtractIndices<pcl::Normal> extract_normals;
     pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>());
 
@@ -81,6 +164,16 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     // convert PointCloud2 to templated PointCloud
     pcl::fromPCLPointCloud2(*pcl_pc, *cloud);
 
+    cv::Mat rgb_image;
+    try {
+        rgb_image = cv_bridge::toCvShare(image_msg, "rgb8")->image;
+    } catch (cv_bridge::Exception& e) {
+        std::cerr << "cv_bridge exception: " << e.what() << std::endl;
+        return;
+    }
+
+    colorizePointCloud(cloud, rgb_image);
+
     if (verbose) {
         std::cerr << "PointCloud has: " << cloud->points.size() << " data points." << std::endl;
     }
@@ -100,25 +193,30 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
         std::cerr << "PointCloud after filtering has: " << cloud_filtered->points.size() << " data points." << std::endl;
     }
 
-    // Estimate point normals
+    // Estimate point normals: for each point calculates the surface normal
+    // uses 50 nearest neighbours to estimate this -crucial for ransac -> they help distinguish
+    // cylinders from random poin distributions
     ne.setSearchMethod(tree);
     ne.setInputCloud(cloud_filtered);
-    ne.setKSearch(50);
+    ne.setKSearch(50);  // look at 50 nearest neighbours
     ne.compute(*cloud_normals);
 
     // limit to upwards orientation
-    Eigen::Vector3f axis(0.0, 0.0, 1.0);
+    Eigen::Vector3f axis(0.0, 0.0, 1.0); // expect cylinders pointing UP (Z axis)
     seg.setAxis(axis);
-    seg.setEpsAngle(0.8);
+    seg.setEpsAngle(0.8); // allow 0.8 radians (~46) deviation from vertical
 
     // Create the segmentation object for cylinder segmentation and set all the parameters
+    // veritcal, match points within 5mm dist from the cylinder surface
+    // only accept cylinders with radius between 7-15cm
+    // use surface noramls to guide the fitting
     seg.setOptimizeCoefficients(true);
-    seg.setModelType(pcl::SACMODEL_CYLINDER);
+    seg.setModelType(pcl::SACMODEL_CYLINDER);  // fit cylinders, not planes/spheres
     seg.setMethodType(pcl::SAC_RANSAC);
-    seg.setNormalDistanceWeight(ransac_normal_distance_weight);
-    seg.setMaxIterations(ransac_max_iterations);
-    seg.setDistanceThreshold(ransac_distance_threshold);
-    seg.setRadiusLimits(target_radius-error_margin, target_radius+error_margin);
+    seg.setNormalDistanceWeight(ransac_normal_distance_weight); // weight normal accuracy
+    seg.setMaxIterations(ransac_max_iterations); // try up to 50 times
+    seg.setDistanceThreshold(ransac_distance_threshold); // 5mm tolerance
+    seg.setRadiusLimits(target_radius-error_margin, target_radius+error_margin); // 7-15cm
     seg.setInputCloud(cloud_filtered);
     seg.setInputNormals(cloud_normals);
     seg.setAxis(axis);
@@ -142,6 +240,10 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     int marker_id = 0;
     int detected_cylinders = 0;
 
+    // each loop iteration: finds the best-fitting cylinder in the remaining cloud
+    // extracts cylinder points and stores them
+    // removes those points from remaining_cloud
+    // repeats up to 3 times or until no more cylinders found
     while (detected_cylinders <= max_detected_cylinders) {
 
         pcl::PointIndices::Ptr inliers_cylinder(new pcl::PointIndices);
@@ -155,6 +257,7 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
             break;
         }
 
+        // extracts the cylinder's radius and number of inlier points from the RANSAC results
         float detected_radius = coefficients_cylinder->values[6];
         int cylinder_points_count = inliers_cylinder->indices.size();
 
@@ -171,6 +274,7 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
         std::string toFrameRel = "map";
         std::string fromFrameRel = (*msg).header.frame_id;
 
+        // coordinate transform
         point_camera.header.frame_id = fromFrameRel;
         point_camera.header.stamp = now;
         point_camera.point.x = coefficients_cylinder->values[0];
@@ -185,12 +289,20 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
             break;
         }
 
-        // accept cylinders within margin
+        // accept cylinders within margin: radius within 4cm of the 11cm target
+        // have at least 500 inlier points
         if ((std::abs(detected_radius - target_radius) <= error_margin) && (cylinder_points_count>=min_cylinder_size)) {
+            
+            ColorStats color_stats = analyzeColors(cloud_cylinder);
+            std::string color_name = identifyColor(color_stats);
 
             if (verbose) {
                 std::cerr << "Cylinder radius: " << detected_radius << std::endl;
                 std::cout << "Cylinder_points_count: " << cylinder_points_count << std::endl;
+                std::cout << "Cylinder color: " << color_name << std::endl;
+                std::cout << "RGB: " << (int)color_stats.avg_r << ", " 
+                            << (int)color_stats.avg_g << ", " 
+                            << (int)color_stats.avg_b << std::endl;
             }
 
             // Publish marker
@@ -211,9 +323,10 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
             marker.scale.y = detected_radius * 2;
             marker.scale.z = marker_height;
 
-            marker.color.r = 0.0f;
-            marker.color.g = 1.0f;
-            marker.color.b = 0.0f;
+            // Set marker color to match detected cylinder
+            marker.color.r = color_stats.avg_r / 255.0f;
+            marker.color.g = color_stats.avg_g / 255.0f;
+            marker.color.b = color_stats.avg_b / 255.0f;
             marker.color.a = 1.0f;
 
             marker.lifetime = rclcpp::Duration(0, 1);
@@ -229,7 +342,7 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
             detected_cylinders++;
         }
 
-        // Remove extracted cylinder from cloud
+        // Remove extracted cylinder from cloud, so the next iteration searches for a diff cylinder
         extract.setNegative(true);
         pcl::PointCloud<PointT>::Ptr temp_cloud(new pcl::PointCloud<PointT>());
         extract.filter(*temp_cloud);
@@ -261,6 +374,7 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
     }    
 }
 
+/*
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
 
@@ -272,6 +386,54 @@ int main(int argc, char** argv) {
     node->declare_parameter<std::string>("topic_pointcloud_in", "/oakd/rgb/preview/depth/points");
     std::string param_topic_pointcloud_in = node->get_parameter("topic_pointcloud_in").as_string();
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription = node->create_subscription<sensor_msgs::msg::PointCloud2>(param_topic_pointcloud_in, 10, &cloud_cb);
+
+    // setup tf listener
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(node->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+    // create publishers
+    planes_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("filtered_point_cloud", 1);
+    cylinder_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("cylinder_point_cloud", 1);
+    marker_pub = node->create_publisher<visualization_msgs::msg::Marker>("cylinder_markers", 1);
+
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}*/
+
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+
+    std::cout << "cylinder_segmentation started" << std::endl;
+
+    node = rclcpp::Node::make_shared("cylinder_segmentation");
+
+    // create subscriber
+    node->declare_parameter<std::string>("topic_pointcloud_in", "/oakd/rgb/preview/depth/points");
+    std::string param_topic_pointcloud_in = node->get_parameter("topic_pointcloud_in").as_string();
+    
+    // CHANGED: Use message_filters to sync point cloud with RGB image
+    message_filters::Subscriber<sensor_msgs::msg::PointCloud2> cloud_sub(
+        node.get(), param_topic_pointcloud_in);
+    message_filters::Subscriber<sensor_msgs::msg::Image> image_sub(
+        node.get(), "/oakd/rgb/preview/image_raw");
+    message_filters::TimeSynchronizer<sensor_msgs::msg::PointCloud2, 
+        sensor_msgs::msg::Image> sync(cloud_sub, image_sub, 10);
+    sync.registerCallback(&cloud_cb);
+
+    // Subscribe to camera_info to get intrinsics
+    auto camera_info_sub = node->create_subscription<sensor_msgs::msg::CameraInfo>(
+        "/oakd/rgb/preview/camera_info", 10, 
+        [](const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
+            fx = msg->k[0];
+            fy = msg->k[4];
+            cx = msg->k[2];
+            cy = msg->k[5];
+            if (verbose) {
+                std::cerr << "Updated camera intrinsics: fx=" << fx << " fy=" << fy 
+                          << " cx=" << cx << " cy=" << cy << std::endl;
+            }
+        });
 
     // setup tf listener
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(node->get_clock());
