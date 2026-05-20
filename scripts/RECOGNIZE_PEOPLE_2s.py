@@ -21,7 +21,7 @@ from deepface import DeepFace
 
 
 DEEPFACE_MODEL = "Facenet"
-UNKNOWN_MAX_COSINE_DISTANCE = 0.40  # 0.0 = enak, 1.0 = povsem drugačen
+UNKNOWN_MAX_COSINE_DISTANCE = 0.30  # 0.0 = enak, 1.0 = povsem drugačen
 
 
 class PeopleRecognizer:
@@ -108,7 +108,7 @@ class PeopleRecognizer:
         return {
             "name": best_name,
             "gender": gender,
-            "job": meta.get("job", "unknown"),
+            "job": meta.get("job"),
             "confidence": round(confidence, 3),
             "distance": round(min_dist, 3),
         }
