@@ -114,18 +114,27 @@ std::string identifyColor(const ColorStats& stats) {
     return "OTHER";
 }
 
+
+/*
+X JE MIRRORED, TREBA POPRAVIT (ZA VIZUALIZACIJO)
+*/
 void colorizePointCloud(pcl::PointCloud<PointT>::Ptr& cloud, const cv::Mat& rgb_image) {
     int colored_count = 0;
     int out_of_bounds = 0;
 
     for (auto& point : cloud->points) {
-        if (point.z <= 0) {
+        if (point.x <= 0) {
             point.r = point.g = point.b = 0;
             continue;
         }
         
-        int u = (int)(fx * point.x / point.z + cx);
-        int v = (int)(fy * point.y / point.z + cy);
+        int u = (int)(fx * point.y / point.x + cx);
+        int v = (int)(fy * (-point.z) / point.x + cy);
+
+        std::cout << "Point: "
+          << point.x << " "
+          << point.y << " "
+          << point.z << std::endl;
         
         if (u >= 0 && u < image_width && v >= 0 && v < image_height) {
             cv::Vec3b bgr = rgb_image.at<cv::Vec3b>(v, u);
@@ -154,24 +163,27 @@ void publishVisualization(
     cv::Mat viz = rgb_image.clone();
     
     for (const auto& point : cloud_cylinder->points) {
-        if (point.z <= 0) continue;
+        if (point.x <= 0) continue;
         
-        int u = (int)(fx * point.x / point.z + cx);
-        int v = (int)(fy * point.y / point.z + cy);
-        
+        int u = (int)(fx * point.y / point.x + cx);
+        int v = (int)(fy * (-point.z) / point.x + cy);
+
         if (u >= 0 && u < viz.cols && v >= 0 && v < viz.rows) {
             // Draw green circles at detected points
             cv::circle(viz, cv::Point(u, v), 3, cv::Scalar(0, 255, 0), -1);
         }
     }
+
+    cv::imshow("Cylinder Detection", viz);
+    cv::waitKey(1);
     
     // Convert Mat to ROS 2 image message and publish
     std_msgs::msg::Header header;
     header.stamp = timestamp;
     header.frame_id = "rgb_frame";
     
-    auto msg = cv_bridge::CvImage(header, "bgr8", viz).toImageMsg();
-    viz_image_pub->publish(msg);
+    auto msg = cv_bridge::CvImage(header, "rgb8", viz).toImageMsg();
+    viz_image_pub->publish(*msg);
 }
 
 // Pointcloud callback
