@@ -40,6 +40,7 @@ ZA DODAT:
 
 */
 
+rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr viz_image_pub;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr planes_pub;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cylinder_pub;
 rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub;
@@ -145,10 +146,10 @@ void colorizePointCloud(pcl::PointCloud<PointT>::Ptr& cloud, const cv::Mat& rgb_
 }
 
 
-void visualizeDetectedPoints(
+void publishVisualization(
     const pcl::PointCloud<PointT>::Ptr& cloud_cylinder,
     const cv::Mat& rgb_image,
-    const std::string& output_filename) {
+    const rclcpp::Time& timestamp) {
     
     cv::Mat viz = rgb_image.clone();
     
@@ -159,14 +160,18 @@ void visualizeDetectedPoints(
         int v = (int)(fy * point.y / point.z + cy);
         
         if (u >= 0 && u < viz.cols && v >= 0 && v < viz.rows) {
-            // Draw a small circle at each point
-            cv::circle(viz, cv::Point(u, v), 2, cv::Scalar(0, 255, 0), -1);
+            // Draw green circles at detected points
+            cv::circle(viz, cv::Point(u, v), 3, cv::Scalar(0, 255, 0), -1);
         }
     }
     
-    // Save the image
-    cv::imwrite(output_filename, viz);
-    std::cout << "Saved visualization to: " << output_filename << std::endl;
+    // Convert Mat to ROS 2 image message and publish
+    std_msgs::msg::Header header;
+    header.stamp = timestamp;
+    header.frame_id = "rgb_frame";
+    
+    auto msg = cv_bridge::CvImage(header, "bgr8", viz).toImageMsg();
+    viz_image_pub->publish(msg);
 }
 
 // Pointcloud callback
@@ -344,10 +349,8 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
             }
 
             // NEW: Visualize which points were used
-            static int cylinder_count = 0;
-            std::string output_file = "/tmp/cylinder_" + std::to_string(cylinder_count) + ".jpg";
-            visualizeDetectedPoints(cloud_cylinder, rgb_image, output_file);
-            cylinder_count++;
+            publishVisualization(cloud_cylinder, rgb_image, now);
+
 
             // Publish marker
             marker.header.frame_id = "map";
@@ -488,6 +491,8 @@ int main(int argc, char** argv) {
     planes_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("filtered_point_cloud", 1);
     cylinder_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("cylinder_point_cloud", 1);
     marker_pub = node->create_publisher<visualization_msgs::msg::Marker>("cylinder_markers", 1);
+    viz_image_pub = node->create_publisher<sensor_msgs::msg::Image>("cylinder_viz_image", 1);  // NEW
+
 
     rclcpp::spin(node);
     rclcpp::shutdown();
