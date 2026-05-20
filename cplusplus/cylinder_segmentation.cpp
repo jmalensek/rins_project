@@ -58,7 +58,7 @@ int image_width = 640, image_height = 480;
 // parameters
 float error_margin = 0.04;  // 4 cm margin for radius error
 float target_radius = 0.11; // 11cm radius
-bool verbose = false; // debug outout
+bool verbose = true; // debug outout
 
 // cloud filtering
 float x_limit_low = 0; // only process points 0-3m in X direction
@@ -114,6 +114,9 @@ std::string identifyColor(const ColorStats& stats) {
 }
 
 void colorizePointCloud(pcl::PointCloud<PointT>::Ptr& cloud, const cv::Mat& rgb_image) {
+    int colored_count = 0;
+    int out_of_bounds = 0;
+
     for (auto& point : cloud->points) {
         if (point.z <= 0) {
             point.r = point.g = point.b = 0;
@@ -128,9 +131,16 @@ void colorizePointCloud(pcl::PointCloud<PointT>::Ptr& cloud, const cv::Mat& rgb_
             point.r = bgr[2];  // BGR to RGB
             point.g = bgr[1];
             point.b = bgr[0];
+            colored_count++;
         } else {
             point.r = point.g = point.b = 128;
+            out_of_bounds++;
         }
+    }
+
+    if (verbose) {
+        std::cerr << "Colorized " << colored_count << " points, " 
+                  << out_of_bounds << " out of bounds" << std::endl;
     }
 }
 
@@ -175,9 +185,10 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
 
     colorizePointCloud(cloud, rgb_image);
 
+    /*
     if (verbose) {
         std::cerr << "PointCloud has: " << cloud->points.size() << " data points." << std::endl;
-    }
+    }*/
 
     // Build a passthrough filter to remove spurious NaNs
     pass.setInputCloud(cloud);
@@ -190,9 +201,10 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
     pass.setFilterLimits(z_limit_low, z_limit_high);
     pass.filter(*cloud_filtered);
     
+    /*
     if (verbose) {
         std::cerr << "PointCloud after filtering has: " << cloud_filtered->points.size() << " data points." << std::endl;
-    }
+    }*/
 
     // Estimate point normals: for each point calculates the surface normal
     // uses 50 nearest neighbours to estimate this -crucial for ransac -> they help distinguish
@@ -330,7 +342,7 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
             marker.color.b = color_stats.avg_b / 255.0f;
             marker.color.a = 1.0f;
 
-            marker.lifetime = rclcpp::Duration(0, 1);
+            marker.lifetime = rclcpp::Duration(0, 0);
 
             marker_pub->publish(marker);
 
@@ -430,10 +442,11 @@ int main(int argc, char** argv) {
             fy = msg->k[4];
             cx = msg->k[2];
             cy = msg->k[5];
+            /*
             if (verbose) {
                 std::cerr << "Updated camera intrinsics: fx=" << fx << " fy=" << fy 
                           << " cx=" << cx << " cy=" << cy << std::endl;
-            }
+            }*/
         });
 
     // setup tf listener
