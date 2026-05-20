@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.5)
 project(rins_project)
 
+cmake_policy(SET CMP0144 NEW)
+cmake_policy(SET CMP0074 NEW)
+
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 14)
 endif()
@@ -17,13 +20,46 @@ find_package(rclpy REQUIRED)
 
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+
+find_package(pcl_conversions REQUIRED)
+find_package(PCL 1.10 REQUIRED)
+
+include_directories(${PCL_INCLUDE_DIRS} include)
+link_directories(${PCL_LIBRARY_DIRS})
+
+set(dependencies rclcpp std_msgs std_srvs geometry_msgs sensor_msgs visualization_msgs tf2 tf2_geometry_msgs pcl_conversions)
+
+add_executable(cylinder_segmentation cplusplus/cylinder_segmentation.cpp)
+ament_target_dependencies(cylinder_segmentation ${dependencies})
+
+target_link_libraries(cylinder_segmentation
+  ${Boost_SYSTEM_LIBRARY}
+  ${PCL_LIBRARY}
+)
+
+install(TARGETS
+  cylinder_segmentation
+  DESTINATION lib/${PROJECT_NAME}/
+)
 
 install(DIRECTORY
   launch
   config
+  embeddings_db
   worlds
   maps
   urdf
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+install(FILES
+  yolo26n-face.pt
+  embeddings.json
   DESTINATION share/${PROJECT_NAME}/
 )
 
@@ -40,6 +76,7 @@ install(PROGRAMS
   scripts/cylinder_detection.py
   scripts/RECOGNIZE_PEOPLE_2s.py
   scripts/greet_people_2s.py
+  scripts/new_cylinder.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
