@@ -101,7 +101,7 @@ class PeopleRecognizer:
             analyze_result = DeepFace.analyze(img_path=image, actions=["gender"], enforce_detection=False)
             gender = analyze_result[0].get("dominant_gender")
         except Exception:
-            return None
+            gender = "?"
 
         meta = self.metadata.get(best_name, {})
 
