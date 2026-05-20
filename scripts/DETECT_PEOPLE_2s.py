@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 import time
 
 import rclpy
@@ -16,6 +17,8 @@ from geometry_msgs.msg import PointStamped
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
+
+from ament_index_python.packages import get_package_share_directory
 
 from ultralytics import YOLO
 
@@ -37,18 +40,14 @@ class detect_faces(Node):
 	def __init__(self, rc: RobotCommander):
 		super().__init__('detect_faces')
 		self.rc = rc
-
-		self.declare_parameters(
-			namespace='',
-			parameters=[
-				('device', ''),
-		])
+		self.package_share_dir = get_package_share_directory("rins_project")
 
 		self.detection_color = (0,0,255)
-		self.device = self.get_parameter('device').get_parameter_value().string_value
+		self.device = 0
+		self.max_visit_distance_m = 5.0
 		self.standoff_distance = 0.65
-		self.min_attempt_interval_s = 0.5
 		self.merge_radius_m = 0.5
+		self.min_location_samples = 3
 
 		self.bridge = CvBridge()
 
@@ -61,29 +60,33 @@ class detect_faces(Node):
 		self.faces = []  # list of dicts: {cx, cy, bbox}
 
 		# tracked locations (map frame):
-		# {"x": float, "y": float, "samples": [(name, gender), ...], "done": bool}
+		# {"x": float, "y": float, "done": bool, "n": int, "sum_x": float, "sum_y": float}
 		self.tracks = []
 
 		# Notify other nodes (e.g., QR scanning) when we have arrived at a person
 		self.current_person_pub = self.create_publisher(String, "/current_person", 10)
 
-		self._last_attempt_time = 0.0
 		self._pending_goal = None
 		self._pending_track = None
 		self._navigating = False
+		self._recognizing_track = None
+		self._recognition_started_t = 0.0
+		self._recognition_timeout_s = 10.0
 
 		try:
-			self.recognizer = PeopleRecognizer("./embeddings_db")
-			self.get_logger().info("Loaded recognition DB from: ./embeddings_db")
+			db_dir = os.path.join(self.package_share_dir, "embeddings_db")
+			self.recognizer = PeopleRecognizer(db_dir)
+			self.get_logger().info(f"Loaded recognition DB from: {db_dir}")
 		except Exception as e:
 			self.recognizer = None
-			self.get_logger().error(f"Could not load recognizer DB from ./embeddings_db: {e}")
+			self.get_logger().error(f"Could not load recognizer DB: {e}")
 
 		# subscribe to image + pointcloud
 		self.rgb_image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.rgb_callback, qos_profile_sensor_data)
 		self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
 
-		self.model = YOLO(MODEL_PATH)
+		model_path = os.path.join(self.package_share_dir, MODEL_PATH)
+		self.model = YOLO(model_path)
 
 
 	# detects faces
@@ -109,7 +112,7 @@ class detect_faces(Node):
 					if x < self.face_t:
 						continue
 
-					self.get_logger().info("Person has been detected!")
+					#self.get_logger().info("Person has been detected!")
 
 					# draw rectangle
 					cv_image = cv2.rectangle(cv_image,(int(bbox[0]), int(bbox[1])),(int(bbox[2]), int(bbox[3])),self.detection_color,3)
@@ -122,6 +125,29 @@ class detect_faces(Node):
 
 					x1 = int(bbox[0]); y1 = int(bbox[1]); x2 = int(bbox[2]); y2 = int(bbox[3])
 					self.faces.append({"cx": cx, "cy": cy, "bbox": (x1, y1, x2, y2)})
+
+			# If we're at a person, try recognition on every RGB frame (no extra waiting)
+			if self._recognizing_track is not None and self.recognizer is not None and self.faces:
+				track_ix = int(self._recognizing_track)
+				if 0 <= track_ix < len(self.tracks) and not self.tracks[track_ix].get("done"):
+					if (time.monotonic() - float(self._recognition_started_t)) <= float(self._recognition_timeout_s):
+						face = max(self.faces, key=lambda f: (f["bbox"][2] - f["bbox"][0]) * (f["bbox"][3] - f["bbox"][1]))
+						crop = self._crop_bbox(self.latest_image, face["bbox"])
+						if crop is not None:
+							result = self.recognizer.recognize(crop)
+							if result is not None and result.get("name"):
+								name = result.get("name")
+								gender = result.get("gender")
+								self.tracks[track_ix]["done"] = True
+								msg = String()
+								msg.data = json.dumps({"person": name, "gender": gender})
+								self.current_person_pub.publish(msg)
+								self.get_logger().info(f"Recognition done. person={name} gender={gender}. Published /current_person.")
+								self._recognizing_track = None
+					else:
+						self.get_logger().warn("Recognition timeout (no match).")
+						self.tracks[track_ix]["done"] = True
+						self._recognizing_track = None
 				
 			cv2.imshow("image", cv_image)
 			key = cv2.waitKey(1)
@@ -143,18 +169,20 @@ class detect_faces(Node):
 				return i
 		return None
 
-	def _majority_name_gender(self, samples):
-		counts = {}
-		for name, gender in samples:
-			if not name:
-				continue
-			key = (name, gender or "?")
-			counts[key] = counts.get(key, 0) + 1
-		if not counts:
-			return None, "?"
-		(name, gender), _ = max(counts.items(), key=lambda kv: kv[1])
-		return name, gender
-
+	def _add_location_sample(self, track_ix: int, x_map: float, y_map: float):
+		t = self.tracks[int(track_ix)]
+		# Keep a running average for stability
+		n = int(t.get("n", 0))
+		sum_x = float(t.get("sum_x", 0.0))
+		sum_y = float(t.get("sum_y", 0.0))
+		n += 1
+		sum_x += float(x_map)
+		sum_y += float(y_map)
+		t["n"] = n
+		t["sum_x"] = sum_x
+		t["sum_y"] = sum_y
+		t["x"] = sum_x / float(n)
+		t["y"] = sum_y / float(n)
 
 	def _crop_bbox(self, image: np.ndarray, bbox):
 		x1, y1, x2, y2 = bbox
@@ -170,6 +198,8 @@ class detect_faces(Node):
 
 	def _queue_navigation(self, track_ix: int, x_map: float, y_map: float):
 		if self._pending_goal is not None or self._navigating:
+			return
+		if self._recognizing_track is not None:
 			return
 		if track_ix is None:
 			return
@@ -213,20 +243,10 @@ class detect_faces(Node):
 			return
 		if self._navigating:
 			if self.rc.isTaskComplete():
-				track_ix = self._pending_track
-				name = None
-				gender = "?"
-				if track_ix is not None and 0 <= int(track_ix) < len(self.tracks):
-					track = self.tracks[int(track_ix)]
-					name, gender = self._majority_name_gender(track.get("samples", []))
-					track["done"] = True
-				if name:
-					msg = String()
-					msg.data = json.dumps({"person": name, "gender": gender})
-					self.current_person_pub.publish(msg)
-					self.get_logger().info(f"Arrived. Majority person={name} gender={gender}. Published /current_person.")
-				else:
-					self.get_logger().warn("Arrived, but no recognition samples to publish.")
+				# Start recognition phase only after arrival
+				self._recognizing_track = self._pending_track
+				self._recognition_started_t = time.monotonic()
+				self.get_logger().info(f"Arrived at track#{self._recognizing_track}. Starting recognition...")
 				self._navigating = False
 				self._pending_goal = None
 				self._pending_track = None
@@ -237,11 +257,12 @@ class detect_faces(Node):
 		self.get_logger().info(f"Going to track#{self._pending_track}...")
 		self.rc.goToPose(self._pending_goal)
 
-
 	def pointcloud_callback(self, data):
 		if self.latest_image is None or self.recognizer is None:
 			return
 		if not self.faces:
+			return
+		if self._recognizing_track is not None:
 			return
 
 		# get point cloud attributes
@@ -252,6 +273,14 @@ class detect_faces(Node):
 		a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
 		a = a.reshape((height, width, 3))
 
+		# lookup TF once per callback: base_link -> map (same as detect_people2.py)
+		try:
+			transform = self.tf_buffer.lookup_transform("map", "base_link", data.header.stamp)
+		except TransformException:
+			try:
+				transform = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
+			except TransformException:
+				return
 
 		# iterate over face coordinates
 		for face in self.faces:
@@ -261,11 +290,6 @@ class detect_faces(Node):
 			if x < 0 or x >= width or y < 0 or y >= height:
 				continue
 
-			now = time.monotonic()
-			if (now - self._last_attempt_time) < self.min_attempt_interval_s:
-				continue
-			self._last_attempt_time = now
-
 			crop = self._crop_bbox(self.latest_image, bbox)
 			if crop is None:
 				continue
@@ -274,17 +298,15 @@ class detect_faces(Node):
 			d = a[y, x, :]
 			if not np.isfinite(d[0]) or not np.isfinite(d[1]) or not np.isfinite(d[2]):
 				continue
+			dist = float(np.linalg.norm(d))
+			if dist > float(self.max_visit_distance_m):
+				continue
 			point_stamped = PointStamped()
-			point_stamped.header.frame_id = data.header.frame_id
+			point_stamped.header.frame_id = "base_link"
 			point_stamped.header.stamp = data.header.stamp
 			point_stamped.point.x = float(d[0])
 			point_stamped.point.y = float(d[1])
 			point_stamped.point.z = float(d[2])
-
-			try:
-				transform = self.tf_buffer.lookup_transform("map", data.header.frame_id, data.header.stamp)
-			except TransformException:
-				return
 
 			point_map = do_transform_point(point_stamped, transform)
 			x1 = float(point_map.point.x)
@@ -294,18 +316,17 @@ class detect_faces(Node):
 			if track_ix is not None and self.tracks[track_ix].get("done"):
 				continue
 			if track_ix is None:
-				self.tracks.append({"x": x1, "y": y1, "samples": [], "done": False})
+				self.tracks.append({"x": x1, "y": y1, "done": False, "n": 0, "sum_x": 0.0, "sum_y": 0.0})
 				track_ix = len(self.tracks) - 1
-				self._queue_navigation(track_ix, x1, y1)
+			self._add_location_sample(track_ix, x1, y1)
 
-			result = self.recognizer.recognize(crop)
-			if result is None:
-				continue
-			name = result.get("name")
-			gender = result.get("gender")
-			if not name:
-				continue
-			self.tracks[track_ix]["samples"].append((name, gender))
+			# if this track isn't done yet, make sure we go to it (but never spam the same goal)
+			if not self.tracks[track_ix].get("done"):
+				if int(self.tracks[track_ix].get("n", 0)) >= int(self.min_location_samples):
+					# Use averaged location for the goal
+					self._queue_navigation(track_ix, float(self.tracks[track_ix]["x"]), float(self.tracks[track_ix]["y"]))
+
+			# recognition happens only after arrival (see process_recognition)
 
 
 
