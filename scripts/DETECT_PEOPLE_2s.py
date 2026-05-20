@@ -77,8 +77,6 @@ class detect_faces(Node):
 		self._recognition_started_t = 0.0
 		self._recognition_timeout_s = 10.0
 		self._last_skip_log_t = 0.0
-		self.face_turn_on_arrival = True
-		self.min_turn_rad = 0.15
 
 		try:
 			db_dir = os.path.join(self.package_share_dir, "embeddings_db")
@@ -109,41 +107,6 @@ class detect_faces(Node):
 		if self._is_visited(x_map, y_map):
 			return
 		self.visited.append((float(x_map), float(y_map)))
-
-	def _wrap_angle(self, a: float) -> float:
-		while a > math.pi:
-			a -= 2.0 * math.pi
-		while a < -math.pi:
-			a += 2.0 * math.pi
-		return a
-
-	def _quat_to_yaw(self, q) -> float:
-		# q: geometry_msgs/Quaternion
-		# yaw = atan2(2(wz + xy), 1 - 2(y^2 + z^2))
-		return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-
-	def _turn_towards_track(self, track_ix: int) -> None:
-		if not self.face_turn_on_arrival:
-			return
-		if getattr(self.rc, "current_pose", None) is None:
-			return
-		if track_ix is None or not (0 <= int(track_ix) < len(self.tracks)):
-			return
-		try:
-			rx = float(self.rc.current_pose.pose.position.x)
-			ry = float(self.rc.current_pose.pose.position.y)
-			q = self.rc.current_pose.pose.orientation
-			cur_yaw = self._quat_to_yaw(q)
-			tx = float(self.tracks[int(track_ix)].get("x", 0.0))
-			ty = float(self.tracks[int(track_ix)].get("y", 0.0))
-			des_yaw = math.atan2(ty - ry, tx - rx)
-			delta = self._wrap_angle(des_yaw - cur_yaw)
-			if abs(delta) < float(self.min_turn_rad):
-				return
-			self.get_logger().info(f"Turning to face track#{track_ix} (delta_yaw={delta:.2f} rad)")
-			self.rc.spin(delta, time_allowance=5)
-		except Exception:
-			return
 
 
 	# detects faces
@@ -302,12 +265,6 @@ class detect_faces(Node):
 			return
 		if self._navigating:
 			if self.rc.isTaskComplete():
-				# Ensure robot faces the person before recognition
-				try:
-					self._turn_towards_track(self._pending_track)
-				except Exception:
-					pass
-
 				# Start recognition phase only after arrival
 				self._recognizing_track = self._pending_track
 				self._recognition_started_t = time.monotonic()
