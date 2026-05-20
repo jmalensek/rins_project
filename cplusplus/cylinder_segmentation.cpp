@@ -137,11 +137,36 @@ void colorizePointCloud(pcl::PointCloud<PointT>::Ptr& cloud, const cv::Mat& rgb_
             out_of_bounds++;
         }
     }
-
+    /*
     if (verbose) {
         std::cerr << "Colorized " << colored_count << " points, " 
                   << out_of_bounds << " out of bounds" << std::endl;
+    }*/
+}
+
+
+void visualizeDetectedPoints(
+    const pcl::PointCloud<PointT>::Ptr& cloud_cylinder,
+    const cv::Mat& rgb_image,
+    const std::string& output_filename) {
+    
+    cv::Mat viz = rgb_image.clone();
+    
+    for (const auto& point : cloud_cylinder->points) {
+        if (point.z <= 0) continue;
+        
+        int u = (int)(fx * point.x / point.z + cx);
+        int v = (int)(fy * point.y / point.z + cy);
+        
+        if (u >= 0 && u < viz.cols && v >= 0 && v < viz.rows) {
+            // Draw a small circle at each point
+            cv::circle(viz, cv::Point(u, v), 2, cv::Scalar(0, 255, 0), -1);
+        }
     }
+    
+    // Save the image
+    cv::imwrite(output_filename, viz);
+    std::cout << "Saved visualization to: " << output_filename << std::endl;
 }
 
 // Pointcloud callback
@@ -317,6 +342,12 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
                             << (int)color_stats.avg_g << ", " 
                             << (int)color_stats.avg_b << std::endl;
             }
+
+            // NEW: Visualize which points were used
+            static int cylinder_count = 0;
+            std::string output_file = "/tmp/cylinder_" + std::to_string(cylinder_count) + ".jpg";
+            visualizeDetectedPoints(cloud_cylinder, rgb_image, output_file);
+            cylinder_count++;
 
             // Publish marker
             marker.header.frame_id = "map";
