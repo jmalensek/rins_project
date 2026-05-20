@@ -1,373 +1,141 @@
 #!/usr/bin/env python3
 
+"""people_recognizer.py
+
+# KNN + embedding cloud za prepoznavo oseb
+Naloži model ki ga je naredil build_embeddings.py.
+
+recognizer = PeopleRecognizer("./embeddings_db")
+result = recognizer.recognize(frame)   # frame = cv2 numpy array ali pot do slike
+# result = {"name": "Luka", "gender": "male", "job": "accountant", "confidence": 0.87}
+"""
+
+import argparse
 import json
-import math
-import os
-import time
+import pickle
+import sys
+from pathlib import Path
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-
-from sensor_msgs.msg import Image, PointCloud2
-from sensor_msgs_py import point_cloud2 as pc2
-
-from geometry_msgs.msg import PointStamped
-
-from cv_bridge import CvBridge, CvBridgeError
-import cv2
 import numpy as np
-
-from ament_index_python.packages import get_package_share_directory
-
-from ultralytics import YOLO
-
-from tf2_ros import TransformListener, Buffer, TransformException
-from tf2_geometry_msgs import do_transform_point
-from geometry_msgs.msg import PoseStamped
-
-from std_msgs.msg import String
-
-from RECOGNIZE_PEOPLE_2s import PeopleRecognizer
-from robot_commander import RobotCommander
-
-MODEL_PATH = "yolo26n-face.pt"
+from deepface import DeepFace
 
 
-
-class detect_faces(Node):
-
-	def __init__(self, rc: RobotCommander):
-		super().__init__('detect_faces')
-		self.rc = rc
-		self.package_share_dir = get_package_share_directory("rins_project")
-
-		self.detection_color = (0,0,255)
-		self.device = 0
-		self.max_visit_distance_m = 5.0
-		self.standoff_distance = 0.65
-		self.merge_radius_m = 0.5
-		self.min_location_samples = 3
-
-		self.bridge = CvBridge()
-
-		# TF2 listener for transform base_link -> map
-		self.tf_buffer = Buffer()
-		self.tf_listener = TransformListener(self.tf_buffer, self)
-
-		self.face_t = 0.7
-		self.latest_image = None
-		self.faces = []  # list of dicts: {cx, cy, bbox}
-
-		# tracked locations (map frame):
-		# {"x": float, "y": float, "done": bool, "n": int, "sum_x": float, "sum_y": float}
-		self.tracks = []
-
-		# Notify other nodes (e.g., QR scanning) when we have arrived at a person
-		self.current_person_pub = self.create_publisher(String, "/current_person", 10)
-
-		self._pending_goal = None
-		self._pending_track = None
-		self._navigating = False
-		self._recognizing_track = None
-		self._recognition_started_t = 0.0
-		self._recognition_timeout_s = 10.0
-
-		try:
-			db_dir = os.path.join(self.package_share_dir, "embeddings_db")
-			self.recognizer = PeopleRecognizer(db_dir)
-			self.get_logger().info(f"Loaded recognition DB from: {db_dir}")
-		except Exception as e:
-			self.recognizer = None
-			self.get_logger().error(f"Could not load recognizer DB: {e}")
-
-		# subscribe to image + pointcloud
-		self.rgb_image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.rgb_callback, qos_profile_sensor_data)
-		self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
-
-		model_path = os.path.join(self.package_share_dir, MODEL_PATH)
-		self.model = YOLO(model_path)
+DEEPFACE_MODEL = "Facenet"
+UNKNOWN_MAX_COSINE_DISTANCE = 0.30  # 0.0 = enak, 1.0 = povsem drugačen
 
 
-	# detects faces
-	def rgb_callback(self, data):
-		self.faces = []
+class PeopleRecognizer:
+    def __init__(
+        self,
+        db_dir: str = "./embeddings_db",
+        unknown_max_distance: float = UNKNOWN_MAX_COSINE_DISTANCE,
+    ):
+        db = Path(db_dir)
+        self.unknown_max_distance = float(unknown_max_distance)
 
-		try:
-			cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
-			self.latest_image = cv_image
+        meta_path = db / "metadata.json"
+        model_path = db / "knn_model.pkl"
 
-			# run inference
-			res = self.model.predict(cv_image, imgsz=(256, 320), show=False, verbose=False, device=self.device)
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Missing {meta_path}")
+        if not model_path.exists():
+            raise FileNotFoundError(f"Missing {model_path}")
 
-			# iterate over results
-			for result in res:
-				if result.boxes is None or len(result.boxes) == 0:
-					continue
+        with open(meta_path) as f:
+            self.metadata = json.load(f)
 
-				for box in result.boxes:
-					bbox = box.xyxy[0]
+        with open(model_path, "rb") as f:
+            saved = pickle.load(f)
+            self.knn = saved["knn"]
+            self.le = saved["label_encoder"]
 
-					x = float(box.conf)
-					if x < self.face_t:
-						continue
+        self._deepface = DeepFace
 
-					#self.get_logger().info("Person has been detected!")
+    def _get_embedding(self, image) -> np.ndarray | None:
+        try:
+            result = self._deepface.represent(
+                img_path=image,
+                model_name=DEEPFACE_MODEL,
+                enforce_detection=False,
+                detector_backend="opencv",
+            )
+            return np.array(result[0]["embedding"], dtype=np.float32)
+        except Exception as e:
+            print(f"Embedding napaka: {e}")
+            return None
 
-					# draw rectangle
-					cv_image = cv2.rectangle(cv_image,(int(bbox[0]), int(bbox[1])),(int(bbox[2]), int(bbox[3])),self.detection_color,3)
+    def recognize(self, image) -> dict | None:
+        emb = self._get_embedding(image)
+        if emb is None:
+            return None
 
-					cx = int((bbox[0] + bbox[2]) / 2)
-					cy = int((bbox[1] + bbox[3]) / 2)
+        emb_2d = emb.reshape(1, -1)
 
-					# draw the center of bounding box
-					cv_image = cv2.circle(cv_image, (cx, cy), 5, self.detection_color, -1)
+        # nearest neighbor distance (cosine)
+        min_dist = float(self.knn.kneighbors(emb_2d, n_neighbors=1)[0][0][0])
+        if min_dist > self.unknown_max_distance:
+            return None
 
-					x1 = int(bbox[0]); y1 = int(bbox[1]); x2 = int(bbox[2]); y2 = int(bbox[3])
-					self.faces.append({"cx": cx, "cy": cy, "bbox": (x1, y1, x2, y2)})
+        # predict class + confidence
+        confidence = None
+        best_name = None
 
-			# If we're at a person, try recognition on every RGB frame (no extra waiting)
-			if self._recognizing_track is not None and self.recognizer is not None and self.faces:
-				track_ix = int(self._recognizing_track)
-				if 0 <= track_ix < len(self.tracks) and not self.tracks[track_ix].get("done"):
-					if (time.monotonic() - float(self._recognition_started_t)) <= float(self._recognition_timeout_s):
-						face = max(self.faces, key=lambda f: (f["bbox"][2] - f["bbox"][0]) * (f["bbox"][3] - f["bbox"][1]))
-						crop = self._crop_bbox(self.latest_image, face["bbox"])
-						if crop is not None:
-							result = self.recognizer.recognize(crop)
-							if result is not None and result.get("name"):
-								name = result.get("name")
-								gender = result.get("gender")
-								self.tracks[track_ix]["done"] = True
-								msg = String()
-								msg.data = json.dumps({"person": name, "gender": gender})
-								self.current_person_pub.publish(msg)
-								self.get_logger().info(f"Recognition done. person={name} gender={gender}. Published /current_person.")
-								self._recognizing_track = None
-					else:
-						self.get_logger().warn("Recognition timeout (no match).")
-						self.tracks[track_ix]["done"] = True
-						self._recognizing_track = None
-				
-			cv2.imshow("image", cv_image)
-			key = cv2.waitKey(1)
-			if key==27:
-				self.get_logger().info("Exiting (ESC pressed)")
-				rclpy.shutdown()
-				return
+        try:
+            proba = self.knn.predict_proba(emb_2d)[0]
+            best_ix = int(np.argmax(proba))
+            class_id = int(self.knn.classes_[best_ix])
+            best_name = self.le.inverse_transform([class_id])[0]
+            confidence = float(proba[best_ix])
+        except Exception:
+            # fallback if predict_proba isn't available
+            class_id = int(self.knn.predict(emb_2d)[0])
+            best_name = self.le.inverse_transform([class_id])[0]
+            confidence = float(max(0.0, 1.0 - min_dist))
 
-			
-		except CvBridgeError as e:
-			print(e)
+        if not best_name:
+            return None
 
+        # gender (best-effort)
+        gender = "?"
+        try:
+            analyze_result = DeepFace.analyze(img_path=image, actions=["gender"], enforce_detection=False)
+            gender = analyze_result[0].get("dominant_gender")
+        except Exception:
+            gender = "?"
 
-	def _find_track_ix(self, x_map: float, y_map: float):
-		for i, t in enumerate(self.tracks):
-			dx = float(t["x"]) - float(x_map)
-			dy = float(t["y"]) - float(y_map)
-			if (dx * dx + dy * dy) <= (self.merge_radius_m * self.merge_radius_m):
-				return i
-		return None
+        meta = self.metadata.get(best_name, {})
 
-	def _add_location_sample(self, track_ix: int, x_map: float, y_map: float):
-		t = self.tracks[int(track_ix)]
-		# Keep a running average for stability
-		n = int(t.get("n", 0))
-		sum_x = float(t.get("sum_x", 0.0))
-		sum_y = float(t.get("sum_y", 0.0))
-		n += 1
-		sum_x += float(x_map)
-		sum_y += float(y_map)
-		t["n"] = n
-		t["sum_x"] = sum_x
-		t["sum_y"] = sum_y
-		t["x"] = sum_x / float(n)
-		t["y"] = sum_y / float(n)
-
-	def _crop_bbox(self, image: np.ndarray, bbox):
-		x1, y1, x2, y2 = bbox
-		h, w = image.shape[:2]
-		x1 = max(0, min(w - 1, x1))
-		x2 = max(0, min(w, x2))
-		y1 = max(0, min(h - 1, y1))
-		y2 = max(0, min(h, y2))
-		if x2 <= x1 or y2 <= y1:
-			return None
-		return image[y1:y2, x1:x2].copy()
+        return {
+            "name": best_name,
+            "gender": gender,
+            "job": meta.get("job"),
+            "confidence": round(confidence, 3),
+            "distance": round(min_dist, 3),
+        }
 
 
-	def _queue_navigation(self, track_ix: int, x_map: float, y_map: float):
-		if self._pending_goal is not None or self._navigating:
-			return
-		if self._recognizing_track is not None:
-			return
-		if track_ix is None:
-			return
-		if not getattr(self.rc, "initial_pose_received", True) or getattr(self.rc, "current_pose", None) is None:
-			self.get_logger().warn("Robot pose not available yet (waiting for amcl_pose)")
-			return
-
-		rx = float(self.rc.current_pose.pose.position.x)
-		ry = float(self.rc.current_pose.pose.position.y)
-
-		dx = x_map - rx
-		dy = y_map - ry
-		dist = math.sqrt(dx * dx + dy * dy)
-		if dist > 1e-6:
-			ux = dx / dist
-			uy = dy / dist
-		else:
-			ux, uy = 0.0, 0.0
-
-		# stop standoff_distance before the target
-		stop = max(0.0, float(self.standoff_distance))
-		goal_x = x_map - ux * stop
-		goal_y = y_map - uy * stop
-		yaw = math.atan2(dy, dx)
-
-		goal = PoseStamped()
-		goal.header.frame_id = "map"
-		goal.header.stamp = self.get_clock().now().to_msg()
-		goal.pose.position.x = float(goal_x)
-		goal.pose.position.y = float(goal_y)
-		goal.pose.position.z = 0.0
-		goal.pose.orientation = self.rc.YawToQuaternion(float(yaw))
-
-		self._pending_goal = goal
-		self._pending_track = int(track_ix)
-		self.get_logger().info(f"Queued navigation to track#{track_ix} at ({goal_x:.2f}, {goal_y:.2f})")
-
-
-	def process_pending(self):
-		if self._pending_goal is None:
-			return
-		if self._navigating:
-			if self.rc.isTaskComplete():
-				# Start recognition phase only after arrival
-				self._recognizing_track = self._pending_track
-				self._recognition_started_t = time.monotonic()
-				self.get_logger().info(f"Arrived at track#{self._recognizing_track}. Starting recognition...")
-				self._navigating = False
-				self._pending_goal = None
-				self._pending_track = None
-			return
-
-		# start navigation
-		self._navigating = True
-		self.get_logger().info(f"Going to track#{self._pending_track}...")
-		self.rc.goToPose(self._pending_goal)
-
-	def pointcloud_callback(self, data):
-		if self.latest_image is None or self.recognizer is None:
-			return
-		if not self.faces:
-			return
-		if self._recognizing_track is not None:
-			return
-
-		# get point cloud attributes
-		height = data.height
-		width = data.width	
-
-		# get 3-channel representation of the point cloud in numpy format (once)
-		a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
-		a = a.reshape((height, width, 3))
-
-		# lookup TF once per callback: base_link -> map (same as detect_people2.py)
-		try:
-			transform = self.tf_buffer.lookup_transform("map", "base_link", data.header.stamp)
-		except TransformException:
-			try:
-				transform = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
-			except TransformException:
-				return
-
-		# iterate over face coordinates
-		for face in self.faces:
-			x = int(face["cx"])
-			y = int(face["cy"])
-			bbox = face["bbox"]
-			if x < 0 or x >= width or y < 0 or y >= height:
-				continue
-
-			crop = self._crop_bbox(self.latest_image, bbox)
-			if crop is None:
-				continue
-
-			# depth lookup + TF to map (needed for location tracking)
-			d = a[y, x, :]
-			if not np.isfinite(d[0]) or not np.isfinite(d[1]) or not np.isfinite(d[2]):
-				continue
-			dist = float(np.linalg.norm(d))
-			if dist > float(self.max_visit_distance_m):
-				continue
-			point_stamped = PointStamped()
-			point_stamped.header.frame_id = "base_link"
-			point_stamped.header.stamp = data.header.stamp
-			point_stamped.point.x = float(d[0])
-			point_stamped.point.y = float(d[1])
-			point_stamped.point.z = float(d[2])
-
-			point_map = do_transform_point(point_stamped, transform)
-			x1 = float(point_map.point.x)
-			y1 = float(point_map.point.y)
-
-			track_ix = self._find_track_ix(x1, y1)
-			if track_ix is not None and self.tracks[track_ix].get("done"):
-				continue
-			if track_ix is None:
-				self.tracks.append({"x": x1, "y": y1, "done": False, "n": 0, "sum_x": 0.0, "sum_y": 0.0})
-				track_ix = len(self.tracks) - 1
-			self._add_location_sample(track_ix, x1, y1)
-
-			# if this track isn't done yet, make sure we go to it (but never spam the same goal)
-			if not self.tracks[track_ix].get("done"):
-				if int(self.tracks[track_ix].get("n", 0)) >= int(self.min_location_samples):
-					# Use averaged location for the goal
-					self._queue_navigation(track_ix, float(self.tracks[track_ix]["x"]), float(self.tracks[track_ix]["y"]))
-
-			# recognition happens only after arrival (see process_recognition)
-
-
-
-
+# try on one picture
+# ros2 run pkg recognize_people_2s -- <image_path>"
 def main():
-	print('Face detection + recognition + navigation node starting.')
+    parser = argparse.ArgumentParser(description="Run face recognition on a single image.")
+    parser.add_argument("image", nargs="?", help="Path to an image file")
+    parser.add_argument("--db", default="./embeddings_db", help="Folder created by build_embeddings.py")
+    parser.add_argument("--threshold", type=float, default=UNKNOWN_MAX_COSINE_DISTANCE, help="Max cosine distance")
+    args = parser.parse_args()
 
-	rclpy.init(args=None)
-	rc = RobotCommander()
+    if not args.image:
+        print("Usage: ros2 run pkg recognize_people_2s -- <image_path>")
+        return 0
 
-	# bring up Nav2 if available
-	try:
-		rc.waitUntilNav2Active()
-	except Exception:
-		pass
+    recognizer = PeopleRecognizer(args.db, unknown_max_distance=args.threshold)
+    result = recognizer.recognize(args.image)
+    if result is None:
+        print("No face recognized.")
+        return 1
 
-	# optional undock (if supported)
-	try:
-		while getattr(rc, "is_docked", None) is None:
-			rclpy.spin_once(rc, timeout_sec=0.5)
-		if getattr(rc, "is_docked", False):
-			rc.undock()
-	except Exception:
-		pass
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
-	node = detect_faces(rc)
 
-	while rclpy.ok():
-		rclpy.spin_once(node, timeout_sec=0.1)
-		rclpy.spin_once(rc, timeout_sec=0.1)
-		node.process_pending()
-
-	node.destroy_node()
-	try:
-		rc.destroyNode()
-	except Exception:
-		pass
-	try:
-		rclpy.shutdown()
-	except Exception as e:
-		print(f"Error during shutdown: {e}")
-	
-if __name__ == '__main__':
-	main()
+if __name__ == "__main__":
+    sys.exit(main())
