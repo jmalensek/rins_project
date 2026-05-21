@@ -1,5 +1,6 @@
 #include <iostream>
 #include <pcl/ModelCoefficients.h>
+#include <pcl/common/centroid.h>
 #include <pcl/features/normal_3d.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/filters/passthrough.h>
@@ -36,11 +37,8 @@
 
 /*
 ZA DODAT:
-- ko detecta barrel, naredi color recognition
-- vse barelle shranjuje - se pravi njegov id, barvo, orientation, lokacija, ali leaka, ali je bil published?
 - to potem publisha na nek topic
-- za preverit kako se orientacijo zamenja - se pravi X ali Y axis
-
+- za preverit kako se orientacijo zamenja - se pravi X ali Y axis?
 */
 
 rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr viz_image_pub;
@@ -110,9 +108,10 @@ static SaveResult upsertCylinder(
     const rclcpp::Time& stamp,
     const geometry_msgs::msg::Point& position_map,
     const std::string& color,
-    const ColorStats& color_stats) {
+    const ColorStats& color_stats,
+    const std::string& orientation) {
 
-    constexpr double kMergeDistance = 0.25; // meters
+    constexpr double kMergeDistance = 0.5; // meters
     const double merge_distance_sq = kMergeDistance * kMergeDistance;
 
     for (auto& existing : saved_cylinders) {
@@ -126,6 +125,7 @@ static SaveResult upsertCylinder(
             existing.position_map = position_map;
             existing.color = color;
             existing.color_stats = color_stats;
+            existing.orientation = orientation;
             // existing.orientation stays as-is (UNKNOWN for now)
             // existing.leakage stays as-is (false for now)
             return SaveResult{existing.cylinder_id, false};
@@ -138,6 +138,7 @@ static SaveResult upsertCylinder(
     rec.position_map = position_map;
     rec.color = color;
     rec.color_stats = color_stats;
+    rec.orientation = orientation;
 
     saved_cylinders.push_back(rec);
 
@@ -447,53 +448,56 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
             ColorStats color_stats = analyzeColors(cloud_cylinder);
             std::string color_name = identifyColor(color_stats);
 
-            // Save cylinder (map coords already computed as point_map)
-            const SaveResult save_result = upsertCylinder(now, point_map.point, color_name, color_stats);
-            const int saved_id = save_result.cylinder_id;
+            if(color_name != "OTHER") {
 
-            if (verbose) {
-                std::cerr << "Cylinder radius: " << detected_radius << std::endl;
-                std::cout << "Cylinder_points_count: " << cylinder_points_count << std::endl;
-                std::cout << "Cylinder color: " << color_name << std::endl;
-                std::cout << "RGB: " << (int)color_stats.avg_r << ", " 
-                            << (int)color_stats.avg_g << ", " 
-                            << (int)color_stats.avg_b << std::endl;
-                std::cout << "Saved cylinder_id: " << saved_id
-                          << (save_result.inserted ? " (new)" : " (merged)")
-                          << " (saved_cylinders=" << saved_cylinders.size() << ")" << std::endl;
+                // Save cylinder (map coords already computed as point_map)
+                const SaveResult save_result = upsertCylinder(now, point_map.point, color_name, color_stats, "VERTICAL");
+                const int saved_id = save_result.cylinder_id;
+
+                if (verbose) {
+                    std::cerr << "Cylinder radius: " << detected_radius << std::endl;
+                    std::cout << "Cylinder color: " << color_name << std::endl;
+                    //std::cout << "RGB: " << (int)color_stats.avg_r << ", " 
+                            // << (int)color_stats.avg_g << ", " 
+                            // << (int)color_stats.avg_b << std::endl;
+                    std::cout << "Orientationally: VERTICAL" << std::endl;
+                    std::cout << "Saved cylinder_id: " << saved_id
+                            << (save_result.inserted ? " (new)" : " (merged)")
+                            << " (saved_cylinders=" << saved_cylinders.size() << ")" << std::endl;
+                }
+
+                // NEW: Visualize which points were used
+                publishVisualization(cloud_cylinder, rgb_image, now);
+
+                // Publish marker
+                marker.header.frame_id = "map";
+                marker.header.stamp = now;
+                marker.ns = "cylinder";
+                marker.id = saved_id;
+
+                marker.type = visualization_msgs::msg::Marker::CYLINDER;
+                marker.action = visualization_msgs::msg::Marker::ADD;
+
+                marker.pose.position.x = point_map.point.x;
+                marker.pose.position.y = point_map.point.y;
+                marker.pose.position.z = marker_height/2;
+                marker.pose.orientation.w = 1.0;
+
+                marker.scale.x = detected_radius * 2;
+                marker.scale.y = detected_radius * 2;
+                marker.scale.z = marker_height;
+
+                // Set marker color to match detected cylinder
+                marker.color.r = color_stats.avg_b / 255.0f;
+                marker.color.g = color_stats.avg_g / 255.0f;
+                marker.color.b = color_stats.avg_r / 255.0f;
+                marker.color.a = 1.0f;
+
+                marker.lifetime = rclcpp::Duration(0, 0);
+
+                marker_pub->publish(marker);
             }
-
-            // NEW: Visualize which points were used
-            publishVisualization(cloud_cylinder, rgb_image, now);
-
-
-            // Publish marker
-            marker.header.frame_id = "map";
-            marker.header.stamp = now;
-            marker.ns = "cylinder";
-            marker.id = saved_id;
-
-            marker.type = visualization_msgs::msg::Marker::CYLINDER;
-            marker.action = visualization_msgs::msg::Marker::ADD;
-
-            marker.pose.position.x = point_map.point.x;
-            marker.pose.position.y = point_map.point.y;
-            marker.pose.position.z = marker_height/2;
-            marker.pose.orientation.w = 1.0;
-
-            marker.scale.x = detected_radius * 2;
-            marker.scale.y = detected_radius * 2;
-            marker.scale.z = marker_height;
-
-            // Set marker color to match detected cylinder
-            marker.color.r = color_stats.avg_b / 255.0f;
-            marker.color.g = color_stats.avg_g / 255.0f;
-            marker.color.b = color_stats.avg_r / 255.0f;
-            marker.color.a = 1.0f;
-
-            marker.lifetime = rclcpp::Duration(0, 0);
-
-            marker_pub->publish(marker);
+            
 
             // Publish cylinder cloud
             sensor_msgs::msg::PointCloud2 cylinder_msg;
@@ -521,7 +525,152 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
         remaining_normals.swap(temp_normals);
     }
 
-    std::cout << "Detected " << detected_cylinders << " cylinders." << std::endl;
+    // Additional pass: detect horizontal cylinders (barrels laying on the floor)
+    // This does not change the existing vertical-detection logic; it runs after it on the leftover points.
+    if (!remaining_cloud->empty() && !remaining_normals->empty()) {
+        const Eigen::Vector3f axis_x(1.0, 0.0, 0.0);
+        const Eigen::Vector3f axis_y(0.0, 1.0, 0.0);
+        const float horizontal_eps_angle = 0.8f; // same tolerance as vertical pass
+
+        auto detectHorizontalWithAxis = [&](const Eigen::Vector3f& axis_h) {
+            seg.setAxis(axis_h);
+            seg.setEpsAngle(horizontal_eps_angle);
+
+            while (true) {
+                pcl::PointIndices::Ptr inliers_cylinder_h(new pcl::PointIndices);
+                pcl::ModelCoefficients::Ptr coefficients_cylinder_h(new pcl::ModelCoefficients);
+
+                seg.setInputCloud(remaining_cloud);
+                seg.setInputNormals(remaining_normals);
+                seg.segment(*inliers_cylinder_h, *coefficients_cylinder_h);
+
+                if (coefficients_cylinder_h->values.empty() || inliers_cylinder_h->indices.empty()) {
+                    break;
+                }
+
+                float detected_radius_h = coefficients_cylinder_h->values[6];
+                int cylinder_points_count_h = inliers_cylinder_h->indices.size();
+
+                pcl::PointCloud<PointT>::Ptr cloud_cylinder_h(new pcl::PointCloud<PointT>());
+                extract.setInputCloud(remaining_cloud);
+                extract.setIndices(inliers_cylinder_h);
+                extract.setNegative(false);
+                extract.filter(*cloud_cylinder_h);
+
+                if (cloud_cylinder_h->empty()) {
+                    break;
+                }
+
+                // For horizontal cylinders the SAC coefficients provide an arbitrary point on the infinite axis,
+                // which can slide along the axis and cause ~meters of position error.
+                // Use the centroid of inlier points as a stable representative position (also preserves height).
+                Eigen::Vector4f centroid_h;
+                pcl::compute3DCentroid(*cloud_cylinder_h, centroid_h);
+
+                geometry_msgs::msg::PointStamped point_camera_h, point_map_h;
+                visualization_msgs::msg::Marker marker_h;
+
+                std::string toFrameRel_h = "map";
+                std::string fromFrameRel_h = (*msg).header.frame_id;
+
+                point_camera_h.header.frame_id = fromFrameRel_h;
+                point_camera_h.header.stamp = now;
+                point_camera_h.point.x = centroid_h[0];
+                point_camera_h.point.y = centroid_h[1];
+                point_camera_h.point.z = centroid_h[2];
+
+                try {
+                    auto tss_h = tf_buffer_->lookupTransform(toFrameRel_h, fromFrameRel_h, now);
+                    tf2::doTransform(point_camera_h, point_map_h, tss_h);
+                } catch (tf2::TransformException& ex) {
+                    std::cout << ex.what() << std::endl;
+                    break;
+                }
+
+                if ((std::abs(detected_radius_h - target_radius) <= error_margin) && (cylinder_points_count_h >= min_cylinder_size)) {
+                    ColorStats color_stats_h = analyzeColors(cloud_cylinder_h);
+                    std::string color_name_h = identifyColor(color_stats_h);
+
+                    
+                    if(color_name_h != "OTHER") {
+
+                        const SaveResult save_result_h = upsertCylinder(
+                            now, point_map_h.point, color_name_h, color_stats_h, "HORIZONTAL");
+                        const int saved_id_h = save_result_h.cylinder_id;
+
+                        if (verbose) {
+                            std::cerr << "[H] Cylinder radius: " << detected_radius_h << std::endl;
+                            std::cout << "[H] Cylinder color: " << color_name_h << std::endl;
+                            std::cout << "Orientationally: HORIZONTAL" << std::endl;
+                            std::cout << "[H] Saved cylinder_id: " << saved_id_h
+                                    << (save_result_h.inserted ? " (new)" : " (merged)")
+                                    << " (saved_cylinders=" << saved_cylinders.size() << ")" << std::endl;
+                        }
+
+                        publishVisualization(cloud_cylinder_h, rgb_image, now);
+
+
+                        marker_h.header.frame_id = "map";
+                        marker_h.header.stamp = now;
+                        marker_h.ns = "cylinder";
+                        marker_h.id = saved_id_h;
+
+                        marker_h.type = visualization_msgs::msg::Marker::CYLINDER;
+                        marker_h.action = visualization_msgs::msg::Marker::ADD;
+
+                        marker_h.pose.position.x = point_map_h.point.x;
+                        marker_h.pose.position.y = point_map_h.point.y;
+                        marker_h.pose.position.z = marker_height / 2;
+                        marker_h.pose.orientation.w = 1.0;
+
+                        marker_h.scale.x = detected_radius_h * 2;
+                        marker_h.scale.y = detected_radius_h * 2;
+                        marker_h.scale.z = marker_height;
+
+                        marker_h.color.r = color_stats_h.avg_b / 255.0f;
+                        marker_h.color.g = color_stats_h.avg_g / 255.0f;
+                        marker_h.color.b = color_stats_h.avg_r / 255.0f;
+                        marker_h.color.a = 1.0f;
+
+                        marker_h.lifetime = rclcpp::Duration(0, 0);
+                        marker_pub->publish(marker_h);
+                    }
+
+                    sensor_msgs::msg::PointCloud2 cylinder_msg_h;
+                    pcl::PCLPointCloud2::Ptr pcl_out_h(new pcl::PCLPointCloud2());
+                    pcl::toPCLPointCloud2(*cloud_cylinder_h, *pcl_out_h);
+                    pcl_conversions::fromPCL(*pcl_out_h, cylinder_msg_h);
+                    *all_cylinders += *cloud_cylinder_h;
+                    detected_cylinders++;
+                }
+
+                // Remove extracted cylinder from remaining (always), continue searching
+                extract.setNegative(true);
+                pcl::PointCloud<PointT>::Ptr temp_cloud_h(new pcl::PointCloud<PointT>());
+                extract.filter(*temp_cloud_h);
+
+                pcl::ExtractIndices<pcl::Normal> extract_normals_iter_h;
+                extract_normals_iter_h.setInputCloud(remaining_normals);
+                extract_normals_iter_h.setIndices(inliers_cylinder_h);
+                extract_normals_iter_h.setNegative(true);
+
+                pcl::PointCloud<pcl::Normal>::Ptr temp_normals_h(new pcl::PointCloud<pcl::Normal>());
+                extract_normals_iter_h.filter(*temp_normals_h);
+
+                remaining_cloud.swap(temp_cloud_h);
+                remaining_normals.swap(temp_normals_h);
+            }
+        };
+
+        detectHorizontalWithAxis(axis_x);
+        detectHorizontalWithAxis(axis_y);
+
+        // Restore expected axis (not strictly necessary, but keeps intent clear)
+        seg.setAxis(Eigen::Vector3f(0.0, 0.0, 1.0));
+        seg.setEpsAngle(0.8);
+    }
+
+    //std::cout << "Detected " << detected_cylinders << " cylinders." << std::endl;
 
     // publish cylinder-filtered point cloud
     if (!all_cylinders->empty()) {
