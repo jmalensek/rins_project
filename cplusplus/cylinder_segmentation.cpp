@@ -109,7 +109,8 @@ static SaveResult upsertCylinder(
     const geometry_msgs::msg::Point& position_map,
     const std::string& color,
     const ColorStats& color_stats,
-    const std::string& orientation) {
+    const std::string& orientation,
+    bool leakage) {
 
     constexpr double kMergeDistance = 0.5; // meters
     const double merge_distance_sq = kMergeDistance * kMergeDistance;
@@ -126,6 +127,7 @@ static SaveResult upsertCylinder(
             existing.color = color;
             existing.color_stats = color_stats;
             existing.orientation = orientation;
+            existing.leakage = leakage;
             // existing.orientation stays as-is (UNKNOWN for now)
             // existing.leakage stays as-is (false for now)
             return SaveResult{existing.cylinder_id, false};
@@ -139,6 +141,7 @@ static SaveResult upsertCylinder(
     rec.color = color;
     rec.color_stats = color_stats;
     rec.orientation = orientation;
+    rec.leakage = leakage;
 
     saved_cylinders.push_back(rec);
 
@@ -149,6 +152,9 @@ static SaveResult upsertCylinder(
 
     return SaveResult{rec.cylinder_id, true};
 }
+
+
+
 
 static std::string formatTimeSec(const rclcpp::Time& t) {
     std::ostringstream oss;
@@ -210,6 +216,111 @@ std::string identifyColor(const ColorStats& stats) {
     if (r > 0.8 && b < 0.5 && g < 0.8) return "BLUE";
     if (b > 0.6 && g > 0.6 && r < 0.3) return "YELLOW";
     return "OTHER";
+}
+
+// leakage se začne tuki
+static std::string identifyColorFromRgb(uint8_t r, uint8_t g, uint8_t b) {
+    ColorStats stats;
+    stats.avg_r = static_cast<float>(r);
+    stats.avg_g = static_cast<float>(g);
+    stats.avg_b = static_cast<float>(b);
+    stats.std_r = stats.std_g = stats.std_b = 0.0f;
+    return identifyColor(stats);
+}
+
+struct LeakageResult {
+    bool leaking = false;
+    std::string dominant1;
+    std::string dominant2;
+    int total_samples = 0;
+};
+
+static LeakageResult detectLeakageHorizontal(
+    const pcl::PointCloud<PointT>::Ptr& reference_cloud,
+    const Eigen::Vector4f& cylinder_centroid_cam,
+    const Eigen::Vector3f& cylinder_axis_cam,
+    const std::string& barrel_color) {
+
+    LeakageResult result;
+    if (!reference_cloud || reference_cloud->empty()) {
+        return result;
+    }
+
+    // Build a floor-parallel ROI:
+    // - along the (horizontal) cylinder axis, elongated by height/2 on each side -> total length = 2*marker_height
+    // - width = radius
+    const float half_length = marker_height;      // (marker_height + marker_height/2 + marker_height/2) / 2
+    const float barrel_half_length = marker_height * 0.5f; // exclude the barrel body itself (keep only front/back)
+    const float half_width = target_radius;       // radius
+    const float z_center = cylinder_centroid_cam[2];
+
+    // Project axis onto the floor plane (XY) so ROI is floor-parallel.
+    Eigen::Vector3f axis_xy(cylinder_axis_cam.x(), cylinder_axis_cam.y(), 0.0f);
+    const float axis_xy_norm = axis_xy.norm();
+    if (axis_xy_norm < 1e-6f) {
+        return result;
+    }
+    axis_xy /= axis_xy_norm;
+    Eigen::Vector3f perp_xy(-axis_xy.y(), axis_xy.x(), 0.0f);
+
+    // Focus on points below the barrel centroid (puddle on the floor).
+    const float max_z_for_floor = z_center - (target_radius * 0.2f);
+
+    std::map<std::string, int> counts;
+
+    for (const auto& p : reference_cloud->points) {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+            continue;
+        }
+        if (p.z > max_z_for_floor) {
+            continue;
+        }
+
+        Eigen::Vector3f delta(p.x - cylinder_centroid_cam[0], p.y - cylinder_centroid_cam[1], 0.0f);
+        const float along = delta.dot(axis_xy);
+        const float perp = delta.dot(perp_xy);
+
+        if (std::abs(along) > half_length || std::abs(perp) > half_width) {
+            continue;
+        }
+
+        // Exclude the barrel itself: keep only points behind/in front of the barrel along its axis.
+        if (std::abs(along) < barrel_half_length) {
+            continue;
+        }
+
+        // Per-point “pixel” classification using the same thresholds as barrel color classification.
+        const std::string c = identifyColorFromRgb(p.r, p.g, p.b);
+        if (c == "OTHER") {
+            continue;
+        }
+
+        counts[c]++;
+        result.total_samples++;
+    }
+
+    // Need enough samples to be meaningful.
+    if (result.total_samples < 50) {
+        return result;
+    }
+
+    // Extract top-2 dominant colors.
+    std::pair<std::string, int> best1{"", 0};
+    std::pair<std::string, int> best2{"", 0};
+    for (const auto& kv : counts) {
+        if (kv.second > best1.second) {
+            best2 = best1;
+            best1 = kv;
+        } else if (kv.second > best2.second) {
+            best2 = kv;
+        }
+    }
+
+    result.dominant1 = best1.first;
+    result.dominant2 = best2.first;
+    result.leaking = (!barrel_color.empty()) &&
+                     (barrel_color == result.dominant1 || barrel_color == result.dominant2);
+    return result;
 }
 
 
@@ -451,7 +562,7 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
             if(color_name != "OTHER") {
 
                 // Save cylinder (map coords already computed as point_map)
-                const SaveResult save_result = upsertCylinder(now, point_map.point, color_name, color_stats, "VERTICAL");
+                const SaveResult save_result = upsertCylinder(now, point_map.point, color_name, color_stats, "VERTICAL", false);
                 const int saved_id = save_result.cylinder_id;
 
                 if (verbose) {
@@ -594,14 +705,31 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
                     
                     if(color_name_h != "OTHER") {
 
+                        // Leakage check: look for dominant colors on the floor-parallel ROI around the horizontal barrel.
+                        // Uses per-point RGB “pixel” classification and compares top-2 ROI colors with barrel color.
+                        const Eigen::Vector3f axis_cam_h(
+                            coefficients_cylinder_h->values[3],
+                            coefficients_cylinder_h->values[4],
+                            coefficients_cylinder_h->values[5]);
+                        const LeakageResult leak = detectLeakageHorizontal(
+                            cloud_filtered,
+                            centroid_h,
+                            axis_cam_h,
+                            color_name_h);
+
+                        const bool is_leaking = leak.leaking;
+
                         const SaveResult save_result_h = upsertCylinder(
-                            now, point_map_h.point, color_name_h, color_stats_h, "HORIZONTAL");
+                            now, point_map_h.point, color_name_h, color_stats_h, "HORIZONTAL", is_leaking);
                         const int saved_id_h = save_result_h.cylinder_id;
 
                         if (verbose) {
                             std::cerr << "[H] Cylinder radius: " << detected_radius_h << std::endl;
                             std::cout << "[H] Cylinder color: " << color_name_h << std::endl;
                             std::cout << "Orientationally: HORIZONTAL" << std::endl;
+                                std::cout << "[H] Leakage: " << (is_leaking ? "true" : "false")
+                                      << " (dominant=[" << leak.dominant1 << ", " << leak.dominant2
+                                      << "] samples=" << leak.total_samples << ")" << std::endl;
                             std::cout << "[H] Saved cylinder_id: " << saved_id_h
                                     << (save_result_h.inserted ? " (new)" : " (merged)")
                                     << " (saved_cylinders=" << saved_cylinders.size() << ")" << std::endl;
