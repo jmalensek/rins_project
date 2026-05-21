@@ -30,6 +30,9 @@
 #include <map>
 #include <cmath>
 #include <algorithm>
+#include <vector>
+#include <string>
+#include <sstream>
 
 /*
 ZA DODAT:
@@ -73,13 +76,107 @@ float ransac_normal_distance_weight = 0.3; // how much to trust normals
 float ransac_distance_threshold = 0.005; // 5mm inlier threshold
 
 float marker_height = 0.4;
-int max_detected_cylinders = 3;
+//int max_detected_cylinders = 20;
 int min_cylinder_size = 500;
 
 struct ColorStats {
     float avg_r, avg_g, avg_b;
     float std_r, std_g, std_b;
 };
+
+struct CylinderRecord {
+    int cylinder_id = -1;
+    rclcpp::Time stamp;
+    geometry_msgs::msg::Point position_map;
+    std::string color;
+
+    // Placeholders for later (requested: don't implement now)
+    std::string orientation = "UNKNOWN"; // e.g. HORIZONTAL/VERTICAL later
+    bool leakage = false;
+
+    ColorStats color_stats;
+};
+
+static std::vector<CylinderRecord> saved_cylinders;
+static int next_cylinder_id = 0;
+static int max_saved_cylinders = 20; // keeps at least 10
+
+struct SaveResult {
+    int cylinder_id = -1;
+    bool inserted = false;
+};
+
+static SaveResult upsertCylinder(
+    const rclcpp::Time& stamp,
+    const geometry_msgs::msg::Point& position_map,
+    const std::string& color,
+    const ColorStats& color_stats) {
+
+    constexpr double kMergeDistance = 0.25; // meters
+    const double merge_distance_sq = kMergeDistance * kMergeDistance;
+
+    for (auto& existing : saved_cylinders) {
+        const double dx = existing.position_map.x - position_map.x;
+        const double dy = existing.position_map.y - position_map.y;
+        const double dz = existing.position_map.z - position_map.z;
+        const double dist_sq = dx * dx + dy * dy + dz * dz;
+
+        if (dist_sq <= merge_distance_sq) {
+            existing.stamp = stamp;
+            existing.position_map = position_map;
+            existing.color = color;
+            existing.color_stats = color_stats;
+            // existing.orientation stays as-is (UNKNOWN for now)
+            // existing.leakage stays as-is (false for now)
+            return SaveResult{existing.cylinder_id, false};
+        }
+    }
+
+    CylinderRecord rec;
+    rec.cylinder_id = next_cylinder_id++;
+    rec.stamp = stamp;
+    rec.position_map = position_map;
+    rec.color = color;
+    rec.color_stats = color_stats;
+
+    saved_cylinders.push_back(rec);
+
+    const int keep = std::max(10, max_saved_cylinders);
+    if ((int)saved_cylinders.size() > keep) {
+        saved_cylinders.erase(saved_cylinders.begin()); // drop oldest
+    }
+
+    return SaveResult{rec.cylinder_id, true};
+}
+
+static std::string formatTimeSec(const rclcpp::Time& t) {
+    std::ostringstream oss;
+    oss.setf(std::ios::fixed);
+    oss.precision(3);
+    oss << t.seconds();
+    return oss.str();
+}
+
+static void printSavedCylindersReport() {
+    std::cout << "\n=== Saved Cylinders Report ===\n";
+    std::cout << "count=" << saved_cylinders.size() << "\n";
+
+    for (const auto& c : saved_cylinders) {
+        std::cout << "- id=" << c.cylinder_id
+                  << " t=" << formatTimeSec(c.stamp)
+                  << " pos_map=[" << c.position_map.x << ", " << c.position_map.y << ", " << c.position_map.z << "]"
+                  << " color=" << c.color
+                  << " orientation=" << c.orientation
+                  << " leakage=" << (c.leakage ? "true" : "false")
+                  << " avg_rgb=[" << (int)c.color_stats.avg_r << ", " << (int)c.color_stats.avg_g << ", " << (int)c.color_stats.avg_b << "]"
+                  << "\n";
+    }
+    std::cout << "=== End Saved Cylinders Report ===\n";
+}
+
+
+int marker_id = 0;
+int detected_cylinders = 0;
 
 ColorStats analyzeColors(const pcl::PointCloud<PointT>::Ptr& cloud) {
     ColorStats stats = {0, 0, 0, 0, 0, 0};
@@ -107,10 +204,10 @@ std::string identifyColor(const ColorStats& stats) {
     
     r /= max_val; g /= max_val; b /= max_val;
     
-    if (r > 0.7 && g < 0.3 && b < 0.3) return "RED";
-    if (g > 0.7 && r < 0.3 && b < 0.3) return "GREEN";
-    if (b > 0.7 && r < 0.3 && g < 0.3) return "BLUE";
-    if (r > 0.6 && g > 0.6 && b < 0.3) return "YELLOW";
+    if (b > 0.7 && g < 0.5 && r < 0.5) return "RED";
+    if (g > 0.7 && b < 0.3 && r < 0.3) return "GREEN";
+    if (r > 0.8 && b < 0.5 && g < 0.8) return "BLUE";
+    if (b > 0.6 && g > 0.6 && r < 0.3) return "YELLOW";
     return "OTHER";
 }
 
@@ -128,13 +225,9 @@ void colorizePointCloud(pcl::PointCloud<PointT>::Ptr& cloud, const cv::Mat& rgb_
             continue;
         }
         
-        int u = (int)(fx * point.y / point.x + cx);
+        int u = (int)(fx * (-point.y) / point.x + cx);
         int v = (int)(fy * (-point.z) / point.x + cy);
 
-        std::cout << "Point: "
-          << point.x << " "
-          << point.y << " "
-          << point.z << std::endl;
         
         if (u >= 0 && u < image_width && v >= 0 && v < image_height) {
             cv::Vec3b bgr = rgb_image.at<cv::Vec3b>(v, u);
@@ -160,17 +253,20 @@ void publishVisualization(
     const cv::Mat& rgb_image,
     const rclcpp::Time& timestamp) {
     
-    cv::Mat viz = rgb_image.clone();
+    //cv::Mat viz = rgb_image.clone();
+
+    cv::Mat viz;
+    cv::cvtColor(rgb_image, viz, cv::COLOR_RGB2BGR);
     
     for (const auto& point : cloud_cylinder->points) {
         if (point.x <= 0) continue;
         
-        int u = (int)(fx * point.y / point.x + cx);
+        int u = (int)(fx * (-point.y) / point.x + cx);
         int v = (int)(fy * (-point.z) / point.x + cy);
 
         if (u >= 0 && u < viz.cols && v >= 0 && v < viz.rows) {
             // Draw green circles at detected points
-            cv::circle(viz, cv::Point(u, v), 3, cv::Scalar(0, 255, 0), -1);
+            cv::circle(viz, cv::Point(u, v), 3, cv::Scalar(50, 0, 50), -1);
         }
     }
 
@@ -182,7 +278,7 @@ void publishVisualization(
     header.stamp = timestamp;
     header.frame_id = "rgb_frame";
     
-    auto msg = cv_bridge::CvImage(header, "rgb8", viz).toImageMsg();
+    auto msg = cv_bridge::CvImage(header, "bgr8", viz).toImageMsg();
     viz_image_pub->publish(*msg);
 }
 
@@ -292,14 +388,14 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
     pcl_conversions::fromPCL(*outcloud_plane, plane_out_msg);
     planes_pub->publish(plane_out_msg);
 
-    int marker_id = 0;
-    int detected_cylinders = 0;
+    //int marker_id = 0;
+    //int detected_cylinders = 0;
 
     // each loop iteration: finds the best-fitting cylinder in the remaining cloud
     // extracts cylinder points and stores them
     // removes those points from remaining_cloud
     // repeats up to 3 times or until no more cylinders found
-    while (detected_cylinders <= max_detected_cylinders) {
+    while (true) {
 
         pcl::PointIndices::Ptr inliers_cylinder(new pcl::PointIndices);
         pcl::ModelCoefficients::Ptr coefficients_cylinder(new pcl::ModelCoefficients);
@@ -351,6 +447,10 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
             ColorStats color_stats = analyzeColors(cloud_cylinder);
             std::string color_name = identifyColor(color_stats);
 
+            // Save cylinder (map coords already computed as point_map)
+            const SaveResult save_result = upsertCylinder(now, point_map.point, color_name, color_stats);
+            const int saved_id = save_result.cylinder_id;
+
             if (verbose) {
                 std::cerr << "Cylinder radius: " << detected_radius << std::endl;
                 std::cout << "Cylinder_points_count: " << cylinder_points_count << std::endl;
@@ -358,6 +458,9 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
                 std::cout << "RGB: " << (int)color_stats.avg_r << ", " 
                             << (int)color_stats.avg_g << ", " 
                             << (int)color_stats.avg_b << std::endl;
+                std::cout << "Saved cylinder_id: " << saved_id
+                          << (save_result.inserted ? " (new)" : " (merged)")
+                          << " (saved_cylinders=" << saved_cylinders.size() << ")" << std::endl;
             }
 
             // NEW: Visualize which points were used
@@ -368,7 +471,7 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
             marker.header.frame_id = "map";
             marker.header.stamp = now;
             marker.ns = "cylinder";
-            marker.id = marker_id++;
+            marker.id = saved_id;
 
             marker.type = visualization_msgs::msg::Marker::CYLINDER;
             marker.action = visualization_msgs::msg::Marker::ADD;
@@ -383,9 +486,9 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
             marker.scale.z = marker_height;
 
             // Set marker color to match detected cylinder
-            marker.color.r = color_stats.avg_r / 255.0f;
+            marker.color.r = color_stats.avg_b / 255.0f;
             marker.color.g = color_stats.avg_g / 255.0f;
-            marker.color.b = color_stats.avg_b / 255.0f;
+            marker.color.b = color_stats.avg_r / 255.0f;
             marker.color.a = 1.0f;
 
             marker.lifetime = rclcpp::Duration(0, 0);
@@ -441,6 +544,11 @@ int main(int argc, char** argv) {
 
     node = rclcpp::Node::make_shared("cylinder_segmentation");
 
+    // Print a final report on shutdown (Ctrl+C / rclcpp::shutdown)
+    rclcpp::on_shutdown([]() {
+        printSavedCylindersReport();
+    });
+
     // create subscriber
     node->declare_parameter<std::string>("topic_pointcloud_in", "/oakd/rgb/preview/depth/points");
     std::string param_topic_pointcloud_in = node->get_parameter("topic_pointcloud_in").as_string();
@@ -466,6 +574,11 @@ int main(int argc, char** argv) {
     std::cout << "cylinder_segmentation started" << std::endl;
 
     node = rclcpp::Node::make_shared("cylinder_segmentation");
+
+    // Print a final report on shutdown (Ctrl+C / rclcpp::shutdown)
+    rclcpp::on_shutdown([]() {
+        printSavedCylindersReport();
+    });
 
     // create subscriber
     node->declare_parameter<std::string>("topic_pointcloud_in", "/oakd/rgb/preview/depth/points");
