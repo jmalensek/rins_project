@@ -240,11 +240,13 @@ class RobotExplorer(Node):
         min_area: int = 500,
         lost_timeout_sec: float = 5.0,
         loop_dt: float = 0.1,
+        fork_look_angle: float = math.pi / 4.0,
         ) -> None:
         self.get_logger().info("Starting to follow the blue line...")
 
         uturn_attempts = 0
         max_uturn_attempts = 2
+        fork_active = False
 
         # Define HSV color range for blue line detection
         lower_blue = np.array([95, 80, 40], dtype=np.uint8)
@@ -281,7 +283,7 @@ class RobotExplorer(Node):
             
             # Only process the lower part of the image to focus on the area near the robot
             h, w, _ = img.shape
-            y0 = int(h * 0.3)
+            y0 = int(h * 0.9)
             roi = img[y0:h, :]
 
             # Convert to HSV color space and create a mask for the blue line
@@ -292,6 +294,16 @@ class RobotExplorer(Node):
 
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             contours = [c for c in contours if cv2.contourArea(c) >= min_area]
+
+            if len(contours) >= 2:
+                if not fork_active:
+                    fork_active = True
+                    self.get_logger().info(
+                        f"Fork detected; inspecting left and right by {fork_look_angle:.2f} rad"
+                    )
+                    self._inspect_fork(fork_look_angle, max_angular_speed)
+            else:
+                fork_active = False
 
             # If no blue line is detected, increment the lost time
             if not contours:
@@ -330,13 +342,13 @@ class RobotExplorer(Node):
             best = None
             best_cx = None
 
-            # Find the contour with the smallest x-coordinate of the centroid (leftmost)
+            # Find the contour with the largest x-coordinate of the centroid (rightmost)
             for c in contours:
                 M = cv2.moments(c)
                 if M['m00'] == 0:
                     continue
                 cx = int(M['m10'] / M['m00'])
-                if best is None or cx < best_cx:
+                if best is None or cx > best_cx:
                     best = c
                     best_cx = cx
 
@@ -365,161 +377,22 @@ class RobotExplorer(Node):
             publish_cmd(v, angular)
             time.sleep(loop_dt)
 
-    # Alternative skeleton approach
-    def follow_blue_line_alt(
-        self,
-        linear_speed: float = 0.2,
-        max_angular_speed: float = 0.5,
-        min_area: int = 500,
-        lost_timeout_sec: float = 4.0,
-        loop_dt: float = 0.1,
-    ) -> None:
-        self.get_logger().info("Starting to follow the blue line (skeleton-based)...")
+    # Stops the robot and looks left/right around a fork before resuming normal motion.
+    def _inspect_fork(self, look_angle: float, angular_speed: float) -> None:
+        stop_msg = TwistStamped()
+        for _ in range(3):
+            stop_msg.header.stamp = self.get_clock().now().to_msg()
+            stop_msg.header.frame_id = 'base_link'
+            self.cmd_vel_pub.publish(stop_msg)
+            time.sleep(0.05)
 
-        # HSV thresholds for blue
-        lower_blue = np.array([95, 80, 40], dtype=np.uint8)
-        upper_blue = np.array([140, 255, 255], dtype=np.uint8)
-        kernel = np.ones((5, 5), np.uint8)
-
-        def publish_cmd(v: float, w: float) -> None:
-            msg = TwistStamped()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = "base_link"
-            msg.twist.linear.x = float(v)
-            msg.twist.angular.z = float(w)
-            self.cmd_vel_pub.publish(msg)
-
-        # --- Minimal thinning (Zhang-Suen) ---
-        def _neighbors(x, y, img):
-            return [img[x-1, y], img[x-1, y+1], img[x, y+1], img[x+1, y+1],
-                    img[x+1, y], img[x+1, y-1], img[x, y-1], img[x-1, y-1]]
-
-        def _transitions(neighbors):
-            n = neighbors + [neighbors[0]]
-            return sum((n[i] == 0 and n[i+1] == 1) for i in range(8))
-
-        def thin(img):
-            # binary 0/1
-            prev = np.zeros_like(img)
-            while True:
-                m = np.zeros_like(img)
-                for i in range(1, img.shape[0]-1):
-                    for j in range(1, img.shape[1]-1):
-                        if img[i, j] != 1:
-                            continue
-                        nb = _neighbors(i, j, img)
-                        if 2 <= sum(nb) <= 6 and _transitions(nb) == 1:
-                            if nb[0] * nb[2] * nb[4] == 0 and nb[2] * nb[4] * nb[6] == 0:
-                                m[i, j] = 1
-                img = img & (~m)
-                m = np.zeros_like(img)
-                for i in range(1, img.shape[0]-1):
-                    for j in range(1, img.shape[1]-1):
-                        if img[i, j] != 1:
-                            continue
-                        nb = _neighbors(i, j, img)
-                        if 2 <= sum(nb) <= 6 and _transitions(nb) == 1:
-                            if nb[0] * nb[2] * nb[6] == 0 and nb[0] * nb[4] * nb[6] == 0:
-                                m[i, j] = 1
-                img = img & (~m)
-                if np.array_equal(img, prev):
-                    break
-                prev = img.copy()
-            return img
-
-        # Wait for first image
-        start_time = self.get_clock().now()
-        while rclpy.ok() and self._last_bgr is None:
-            if (self.get_clock().now() - start_time).nanoseconds * 1e-9 > 2.0:
-                self.get_logger().warn("No camera image received; cannot follow line.")
-                return
-            rclpy.spin_once(self, timeout_sec=0.1)
-
-        lost_time = 0.0
-        bias_vector = None  # heading bias after junction choice
-        bias_ttl = 0
-
-        while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.0)
-            img = self._last_bgr
-            if img is None:
-                time.sleep(loop_dt)
-                continue
-
-            h, w, _ = img.shape
-            y0 = int(h * 0.3)
-            roi = img[y0:h, :]
-
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            mask = cv2.inRange(hsv, lower_blue, upper_blue)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-            # Dead-end check on raw mask area
-            if cv2.countNonZero(mask) < min_area:
-                lost_time += loop_dt
-                publish_cmd(0.0, 0.0)
-                if lost_time >= lost_timeout_sec:
-                    self.get_logger().info("Line lost; U-turn.")
-                    self.turn(math.pi, angular_speed=max(0.2, max_angular_speed))
-                    lost_time = 0.0
-                    bias_vector = None
-                    bias_ttl = 0
-                time.sleep(loop_dt)
-                continue
-            lost_time = 0.0
-
-            # Skeletonize
-            skel = (mask > 0).astype(np.uint8)
-            skel = thin(skel)
-
-            # Get skeleton points in a forward lookahead band
-            look_y0 = int(roi.shape[0] * 0.25)
-            look = skel[look_y0:, :]
-            ys, xs = np.where(look > 0)
-            if len(xs) < 20:
-                publish_cmd(0.0, 0.0)
-                time.sleep(loop_dt)
-                continue
-
-            # Estimate heading by PCA on skeleton points
-            pts = np.stack([xs, ys], axis=1).astype(np.float32)
-            mean = np.mean(pts, axis=0)
-            cov = np.cov((pts - mean).T)
-            eigvals, eigvecs = np.linalg.eig(cov)
-            main_dir = eigvecs[:, np.argmax(eigvals)]
-            if main_dir[1] < 0:
-                main_dir = -main_dir  # forward in image coordinates
-
-            # Simple junction detection: multiple direction modes
-            # If spread is large, prefer leftmost direction
-            spread = np.std(np.arctan2(pts[:, 1] - mean[1], pts[:, 0] - mean[0]))
-            if spread > 0.6 or bias_ttl <= 0:
-                # choose leftmost direction by minimizing x at some forward y
-                forward_y = mean[1] + 40.0
-                # line model: p = mean + t * main_dir; pick t so y = forward_y
-                t = (forward_y - mean[1]) / (main_dir[1] + 1e-6)
-                target = mean + t * main_dir
-                # bias vector points toward left if possible
-                bias_vector = target
-                bias_ttl = 15
-
-            bias_ttl -= 1
-
-            # Pure-pursuit style target in image space
-            target = bias_vector if bias_vector is not None else mean + 40.0 * main_dir
-            tx = float(target[0])
-            center_x = float(w) / 2.0
-            error_px = tx - center_x
-
-            # Steering
-            k_p = 0.003
-            angular = -k_p * error_px
-            angular = max(-max_angular_speed, min(max_angular_speed, angular))
-            v = linear_speed * max(0.3, 1.0 - abs(angular) / max_angular_speed)
-
-            publish_cmd(v, angular)
-            time.sleep(loop_dt)
+        self.turn(abs(look_angle), angular_speed=max(0.2, angular_speed))
+        time.sleep(0.2)
+        self.turn(-abs(look_angle), angular_speed=max(0.2, angular_speed))
+        time.sleep(0.2)
+        self.turn(-abs(look_angle), angular_speed=max(0.2, angular_speed))
+        time.sleep(0.2)
+        self.turn(abs(look_angle), angular_speed=max(0.2, angular_speed))
 
     # NAVIGATION HELPER METHODS
 
