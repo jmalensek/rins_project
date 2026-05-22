@@ -20,8 +20,6 @@ import subprocess
 from tf2_ros import TransformListener, Buffer, TransformException
 from tf2_geometry_msgs import do_transform_point
 
-from std_msgs.msg import Bool
-
 
 class detect_rings(Node):
 
@@ -42,7 +40,7 @@ class detect_rings(Node):
         self.bridge = CvBridge()
         self.scan = None
 
-        self.detected_colors = set()
+        self.detected_rings = []
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -51,7 +49,6 @@ class detect_rings(Node):
         self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
 
         self.marker_pub = self.create_publisher(Marker, marker_topic, QoSReliabilityPolicy.RELIABLE)
-        self.finished_pub = self.create_publisher(Bool, "/finished", 10)
 
         self.rings = []
         # clustering
@@ -353,17 +350,36 @@ class detect_rings(Node):
 
             self.marker_pub.publish(marker)
             
-            name = color["name"] if color else "unknown"
-            if name not in self.detected_colors:
-                self.detected_colors.add(name)
+            already_saved = False
 
-            if len(self.detected_colors) >= 2:
-                self.get_logger().info(f"Detected 2 rings with colors: {', '.join(self.detected_colors)}. Publishing finished signal.")
-                self.finished_pub.publish(Bool(data=True))
-                self.get_logger().info("Done. Published /finished=True. Shutting down node.")
+            for saved_ring in self.detected_rings:
+                if saved_ring["id"] == i:
+                    already_saved = True
+                    break
 
-                # Optionally, stop further processing or exit
-                rclpy.shutdown()
+            if not already_saved:
+                ring_info = {
+                    "id": i,
+                    "position": {
+                        "x": cx,
+                        "y": cy,
+                        "z": cz
+                    },
+                    "color": color["name"] if color else "unknown"
+                }
+
+                self.detected_rings.append(ring_info)
+
+                self.get_logger().info(
+                    f"Stored ring {i}: {ring_info}"
+                )
+
+                name = color["name"] if color else "unknown"
+
+                if name not in self.detected_colors:
+                    self.detected_colors.add(name)
+
+
     def detect_ring_color(self, cv_image, cx, cy, r):
         h_img, w_img = cv_image.shape[:2]
 
@@ -442,22 +458,31 @@ class detect_rings(Node):
         chroma = np.sqrt(A ** 2 + B ** 2)
 
         if chroma < 15:
-            # Achromatic — classify purely by lightness
-            if L < 25:      return "black"
-            elif L < 70:    return "grey"
-            else:           return "white"
-
-        # Chromatic — hue angle in LAB (atan2 of B over A)
+            if L < 15:
+                return "black"
+            elif L > 95:
+                return "white"
+            else:
+                return "unknown"
+    
+        # --- Chromatic colors — use hue angle ---
         hue = np.degrees(np.arctan2(B, A)) % 360
 
-        if hue < 15 or hue >= 345:     return "red"
-        elif hue < 45:                  return "orange"
-        elif hue < 75:                  return "yellow"
-        elif hue < 150:                 return "green"
-        elif hue < 195:                 return "cyan"
-        elif hue < 255:                 return "blue"
-        elif hue < 285:                 return "purple"
-        else:                           return "magenta"
+        if hue < 42 or hue >= 330:
+            return "red"
+        elif 42 <= hue < 75:
+            return "yellow"
+        elif 75 <= hue < 145:
+            # Extra guard: true green has positive B, blue has negative B
+            if B > 0 and A < 10:
+                return "green"
+            elif B <= 5:
+                return "blue"   # shifted blue caught in green range
+            return "green"
+        elif 145 <= hue < 260:
+            return "blue"
+        else:
+            return "unknown"
 
 
     def lab_to_marker_rgb(self, lab):
@@ -467,20 +492,52 @@ class detect_rings(Node):
         bgr = np.clip(bgr, 0, 1)
         b, g, r = bgr[0, 0]
         return float(r), float(g), float(b)
-            
+
+    def print_detected_rings(self):
+
+        self.get_logger().info("========== DETECTED RINGS ==========")
+
+        if len(self.detected_rings) == 0:
+
+            self.get_logger().info("No rings stored.")
+
+            return
+
+        for ring in self.detected_rings:
+
+            ring_id = ring["id"]
+
+            pos = ring["position"]
+
+            color = ring["color"]
+
+            self.get_logger().info(
+                f"Ring ID: {ring_id} | "
+                f"Color: {color} | "
+                f"Position: "
+                f"x={pos['x']:.3f}, "
+                f"y={pos['y']:.3f}, "
+                f"z={pos['z']:.3f}"
+            )           
 
 def main():
     print('Ring detection node starting.')
 
     rclpy.init(args=None)
     node = detect_rings()
-    rclpy.spin(node)
-    node.destroy_node()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        print("Shutting down ring detector.")
+    finally:
+        node.print_detected_rings()
+
+        node.destroy_node()
         
-    try:    
-        rclpy.shutdown()
-    except Exception as e:
-        print(f"Error during shutdown: {e}")
+        try:    
+            rclpy.shutdown()
+        except Exception as e:
+            print(f"Error during shutdown: {e}")
 
 if __name__ == '__main__':
     main()
