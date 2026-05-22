@@ -56,6 +56,12 @@ class detect_faces(Node):
 
 		self.bridge = CvBridge()
 
+		# cache latest pointcloud as numpy (height, width, 3) in base_link frame
+		self.latest_pc = None
+		self.latest_pc_header = None
+		self.pc_height = None
+		self.pc_width = None
+
 		# TF2 listener for transform base_link -> map
 		self.tf_buffer = Buffer()
 		self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -78,7 +84,7 @@ class detect_faces(Node):
 		self._navigating = False
 		self._recognizing_track = None
 		self._recognition_started_t = 0.0
-		self._recognition_timeout_s = 10.0
+		self._recognition_timeout_s = 20.0
 		self._last_skip_log_t = 0.0
 
 		try:
@@ -246,6 +252,105 @@ class detect_faces(Node):
 		return image[y1:y2, x1:x2].copy()
 
 
+	def _rotate_vector_by_quaternion(self, v, q):
+		"""Rotate 3-vector v (iterable) by geometry_msgs Quaternion q."""
+		qx, qy, qz, qw = q.x, q.y, q.z, q.w
+		qvec = np.array([qx, qy, qz], dtype=float)
+		v = np.array(v, dtype=float)
+		t = 2.0 * np.cross(qvec, v)
+		vprime = v + qw * t + np.cross(qvec, t)
+		return float(vprime[0]), float(vprime[1]), float(vprime[2])
+
+	def _estimate_plane_normal_from_track(self, track_ix: int, window: int = 15, min_points: int = 50):
+		"""Estimate plane point and normal in map frame for the track using cached pointcloud.
+		Returns ((px,py,pz), (nx,ny,nz)) or None on failure.
+		"""
+		if self.latest_pc is None:
+			return None
+		if track_ix < 0 or track_ix >= len(self.tracks):
+			return None
+		t = self.tracks[int(track_ix)]
+		if 'img_cx' not in t or 'img_cy' not in t:
+			return None
+		cx = int(t['img_cx'])
+		cy = int(t['img_cy'])
+		h = int(self.pc_height)
+		w = int(self.pc_width)
+		# bounds
+		x0 = max(0, cx - window)
+		x1 = min(w - 1, cx + window)
+		y0 = max(0, cy - window)
+		y1 = min(h - 1, cy + window)
+		sub = self.latest_pc[y0:y1+1, x0:x1+1, :].reshape(-1, 3)
+		# filter finite
+		mask = np.isfinite(sub).all(axis=1)
+		pts = sub[mask]
+		if pts.shape[0] < int(min_points):
+			return None
+		# fit plane by SVD
+		centroid = np.mean(pts, axis=0)
+		A = pts - centroid
+		U, S, Vt = np.linalg.svd(A, full_matrices=False)
+		normal = Vt[-1, :]
+		# create PointStamped in base_link
+		ps = PointStamped()
+		ps.header.frame_id = 'base_link'
+		ps.header.stamp = self.latest_pc_header.stamp if self.latest_pc_header is not None else self.get_clock().now().to_msg()
+		ps.point.x = float(centroid[0])
+		ps.point.y = float(centroid[1])
+		ps.point.z = float(centroid[2])
+		# transform point to map
+		try:
+			transform = self.tf_buffer.lookup_transform('map', 'base_link', ps.header.stamp)
+		except TransformException:
+			try:
+				transform = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+			except TransformException:
+				return None
+		point_map = do_transform_point(ps, transform)
+		# rotate normal into map frame
+		nx, ny, nz = self._rotate_vector_by_quaternion(normal.tolist(), transform.transform.rotation)
+		# normalize
+		norm = math.sqrt(nx * nx + ny * ny + nz * nz)
+		if norm < 1e-6:
+			return None
+		nx /= norm; ny /= norm; nz /= norm
+		return ((point_map.point.x, point_map.point.y, point_map.point.z), (nx, ny, nz))
+
+	def _build_goal_from_plane_nearest_side(self, point_map, normal_map):
+		"""Build a standoff goal on the normal side that is closest to the robot.
+		Returns (goal_x, goal_y, goal_yaw).
+		"""
+		if getattr(self.rc, "current_pose", None) is None:
+			return None
+		r_x = float(self.rc.current_pose.pose.position.x)
+		r_y = float(self.rc.current_pose.pose.position.y)
+		stop = max(0.0, float(self.standoff_distance))
+		px = float(point_map[0])
+		py = float(point_map[1])
+		nx = float(normal_map[0])
+		ny = float(normal_map[1])
+
+		# Two possible standoff points: one on each side of the wall normal.
+		g1x = px - nx * stop
+		g1y = py - ny * stop
+		g2x = px + nx * stop
+		g2y = py + ny * stop
+
+		d1 = (g1x - r_x) * (g1x - r_x) + (g1y - r_y) * (g1y - r_y)
+		d2 = (g2x - r_x) * (g2x - r_x) + (g2y - r_y) * (g2y - r_y)
+
+		# Always choose side closer to robot to avoid navigating around the wall.
+		if d1 <= d2:
+			goal_x, goal_y = g1x, g1y
+		else:
+			goal_x, goal_y = g2x, g2y
+
+		# Face the image plane (toward wall point).
+		goal_yaw = math.atan2(py - goal_y, px - goal_x)
+		return goal_x, goal_y, goal_yaw
+
+
 	def _queue_navigation(self, track_ix: int, x_map: float, y_map: float):
 		if self._pending_goal is not None or self._navigating:
 			return
@@ -269,19 +374,37 @@ class detect_faces(Node):
 		else:
 			ux, uy = 0.0, 0.0
 
-		# stop standoff_distance before the target
-		stop = max(0.0, float(self.standoff_distance))
-		goal_x = x_map - ux * stop
-		goal_y = y_map - uy * stop
-		yaw = math.atan2(dy, dx)
-
-		goal = PoseStamped()
-		goal.header.frame_id = "map"
-		goal.header.stamp = self.get_clock().now().to_msg()
-		goal.pose.position.x = float(goal_x)
-		goal.pose.position.y = float(goal_y)
-		goal.pose.position.z = 0.0
-		goal.pose.orientation = self.rc.YawToQuaternion(float(yaw))
+		# Try to compute plane normal from recent pointcloud around the track's image
+		goal = None
+		try:
+			plane_result = self._estimate_plane_normal_from_track(track_ix)
+			if plane_result is not None:
+				(point_map, normal_map) = plane_result
+				selected = self._build_goal_from_plane_nearest_side(point_map, normal_map)
+				if selected is not None:
+					goal_x, goal_y, yaw = selected
+					goal = PoseStamped()
+					goal.header.frame_id = "map"
+					goal.header.stamp = self.get_clock().now().to_msg()
+					goal.pose.position.x = float(goal_x)
+					goal.pose.position.y = float(goal_y)
+					goal.pose.position.z = 0.0
+					goal.pose.orientation = self.rc.YawToQuaternion(float(yaw))
+		except Exception:
+			goal = None
+		# fallback: stop_standoff along current approach direction
+		if goal is None:
+			stop = max(0.0, float(self.standoff_distance))
+			goal_x = x_map - ux * stop
+			goal_y = y_map - uy * stop
+			yaw = math.atan2(dy, dx)
+			goal = PoseStamped()
+			goal.header.frame_id = "map"
+			goal.header.stamp = self.get_clock().now().to_msg()
+			goal.pose.position.x = float(goal_x)
+			goal.pose.position.y = float(goal_y)
+			goal.pose.position.z = 0.0
+			goal.pose.orientation = self.rc.YawToQuaternion(float(yaw))
 
 		self._pending_goal = goal
 		self._pending_track = int(track_ix)
@@ -329,6 +452,11 @@ class detect_faces(Node):
 		# get 3-channel representation of the point cloud in numpy format (once)
 		a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
 		a = a.reshape((height, width, 3))
+		# cache latest pointcloud
+		self.latest_pc = a
+		self.latest_pc_header = data.header
+		self.pc_height = height
+		self.pc_width = width
 
 		# lookup TF once per callback: base_link -> map (same as detect_people2.py)
 		try:
@@ -382,12 +510,19 @@ class detect_faces(Node):
 			if track_ix is not None:
 				# Always refine the averaged location for an existing track.
 				self._add_location_sample(track_ix, x1, y1)
+				# update image coordinates for this track (used for plane estimation)
+				try:
+					self.tracks[track_ix]["img_cx"] = int(face["cx"])
+					self.tracks[track_ix]["img_cy"] = int(face["cy"])
+					self.tracks[track_ix]["pc_stamp"] = data.header.stamp
+				except Exception:
+					pass
 				if self.tracks[track_ix].get("done"):
 					# Ensure the visited list stays aligned with the refined track.
 					self._remember_visited(float(self.tracks[track_ix].get("x", 0.0)), float(self.tracks[track_ix].get("y", 0.0)))
 					continue
 			else:
-				self.tracks.append({"x": x1, "y": y1, "done": False, "n": 0, "sum_x": 0.0, "sum_y": 0.0, "marker_published": False})
+				self.tracks.append({"x": x1, "y": y1, "done": False, "n": 0, "sum_x": 0.0, "sum_y": 0.0, "marker_published": False, "img_cx": int(face["cx"]), "img_cy": int(face["cy"]), "pc_stamp": data.header.stamp})
 				track_ix = len(self.tracks) - 1
 				self._add_location_sample(track_ix, x1, y1)
 
