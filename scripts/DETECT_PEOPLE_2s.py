@@ -26,7 +26,7 @@ from tf2_ros import TransformListener, Buffer, TransformException
 from tf2_geometry_msgs import do_transform_point
 from geometry_msgs.msg import PoseStamped
 
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from visualization_msgs.msg import Marker
 
 from RECOGNIZE_PEOPLE_2s import PeopleRecognizer
@@ -76,6 +76,8 @@ class detect_faces(Node):
 
 		# Notify other nodes (e.g., QR scanning) when we have arrived at a person
 		self.current_person_pub = self.create_publisher(String, "/current_person", 10)
+		# Signals when we're actively approaching/handling a person (nav + recognition)
+		self.approach_active_pub = self.create_publisher(Bool, "/approach_active", 10)
 		# RViz marker for stabilized person locations (map frame)
 		self.marker_pub = self.create_publisher(Marker, "/face_markers", 10)
 
@@ -199,11 +201,13 @@ class detect_faces(Node):
 								self.current_person_pub.publish(msg)
 								self.get_logger().info(f"Recognition done. person={name} gender={gender}. Published /current_person.")
 								self._recognizing_track = None
+								self.approach_active_pub.publish(Bool(data=False))
 					else:
 						self.get_logger().warn("Recognition timeout (no match).")
 						self.tracks[track_ix]["done"] = True
 						self._remember_visited(float(self.tracks[track_ix].get("x", 0.0)), float(self.tracks[track_ix].get("y", 0.0)))
 						self._recognizing_track = None
+						self.approach_active_pub.publish(Bool(data=False))
 				
 			cv2.imshow("image", cv_image)
 			key = cv2.waitKey(1)
@@ -435,10 +439,11 @@ class detect_faces(Node):
 		# start navigation
 		self._navigating = True
 		self.get_logger().info(f"Going to track#{self._pending_track}...")
+		self.approach_active_pub.publish(Bool(data=True))
 		self.rc.goToPose(self._pending_goal)
 
 	def pointcloud_callback(self, data):
-		if self.latest_image is None:
+		if self.latest_image is None or self.recognizer is None:
 			return
 		if not self.faces:
 			return
