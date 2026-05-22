@@ -1,40 +1,87 @@
-kappa@isildur:~/Documents/Task1_robot/src$ colcon build --symlink-install
-Starting >>> dis_tutorial7
-Starting >>> rins_project
-Finished <<< dis_tutorial7 [0.08s]
---- stderr: rins_project                             
-CMake Warning (dev) at /usr/lib/x86_64-linux-gnu/cmake/pcl/Modules/FindFLANN.cmake:45 (find_package):
-  Policy CMP0144 is not set: find_package uses upper-case <PACKAGENAME>_ROOT
-  variables.  Run "cmake --help-policy CMP0144" for policy details.  Use the
-  cmake_policy command to set the policy and suppress this warning.
+cmake_minimum_required(VERSION 3.5)
+project(rins_project)
 
-  CMake variable FLANN_ROOT is set to:
+cmake_policy(SET CMP0144 NEW)
+cmake_policy(SET CMP0074 NEW)
 
-    /usr
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 14)
+endif()
 
-  For compatibility, find_package is ignoring the variable, but code in a
-  .cmake module might still use it.
-Call Stack (most recent call first):
-  /usr/lib/x86_64-linux-gnu/cmake/pcl/PCLConfig.cmake:261 (find_package)
-  /usr/lib/x86_64-linux-gnu/cmake/pcl/PCLConfig.cmake:306 (find_flann)
-  /usr/lib/x86_64-linux-gnu/cmake/pcl/PCLConfig.cmake:570 (find_external_library)
-  /opt/ros/jazzy/share/pcl_conversions/cmake/ament_cmake_export_dependencies-extras.cmake:21 (find_package)
-  /opt/ros/jazzy/share/pcl_conversions/cmake/pcl_conversionsConfig.cmake:41 (include)
-  CMakeLists.txt:29 (find_package)
-This warning is for project developers.  Use -Wno-dev to suppress it.
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
 
-/home/kappa/Documents/Task1_robot/src/rins_project/cplusplus/cylinder_segmentation.cpp:24:10: fatal error: cv_bridge/cv_bridge.h: No such file or directory
-   24 | #include <cv_bridge/cv_bridge.h>
-      |          ^~~~~~~~~~~~~~~~~~~~~~~
-compilation terminated.
-gmake[2]: *** [CMakeFiles/cylinder_segmentation.dir/build.make:76: CMakeFiles/cylinder_segmentation.dir/cplusplus/cylinder_segmentation.cpp.o] Error 1
-gmake[1]: *** [CMakeFiles/Makefile2:137: CMakeFiles/cylinder_segmentation.dir/all] Error 2
-gmake: *** [Makefile:146: all] Error 2
----
-Failed   <<< rins_project [3.39s, exited with code 2]
+find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 
-Summary: 1 package finished [3.54s]
-  1 package failed: rins_project
-  1 package had stderr output: rins_project
-kappa@isildur:~/Documents/Task1_robot/src$ colcon build --symlink-install
+find_package(rclcpp REQUIRED)
+find_package(rclpy REQUIRED)
 
+find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(message_filters REQUIRED)
+find_package(cv_bridge REQUIRED)
+
+find_package(OpenCV REQUIRED)
+
+find_package(pcl_conversions REQUIRED)
+find_package(PCL 1.10 REQUIRED)
+
+include_directories(${PCL_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS} include)
+link_directories(${PCL_LIBRARY_DIRS})
+
+set(dependencies rclcpp std_msgs std_srvs geometry_msgs sensor_msgs visualization_msgs tf2 tf2_geometry_msgs pcl_conversions message_filters cv_bridge)
+
+add_executable(cylinder_segmentation cplusplus/cylinder_segmentation.cpp)
+ament_target_dependencies(cylinder_segmentation ${dependencies})
+
+target_link_libraries(cylinder_segmentation
+  ${Boost_SYSTEM_LIBRARY}
+  ${PCL_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+)
+
+install(TARGETS
+  cylinder_segmentation
+  DESTINATION lib/${PROJECT_NAME}/
+)
+
+install(DIRECTORY
+  launch
+  config
+  embeddings_db
+  worlds
+  maps
+  urdf
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+install(FILES
+  yolo26n-face.pt
+  embeddings.json
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+install(PROGRAMS
+  scripts/detect_people.py
+  scripts/DETECT_PEOPLE_2s.py
+  scripts/QR_NODE_2s.py
+  scripts/robot_commander.py
+  scripts/robot_explorer.py
+  scripts/detect_people2.py
+  scripts/detect_rings27.py
+  scripts/greet_people.py
+  scripts/greet_people_faster.py
+  scripts/cylinder_detection.py
+  scripts/RECOGNIZE_PEOPLE_2s.py
+  scripts/greet_people_2s.py
+  scripts/new_cylinder.py
+  DESTINATION lib/${PROJECT_NAME})
+
+ament_package()
