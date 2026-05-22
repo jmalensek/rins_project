@@ -246,11 +246,13 @@ class RobotExplorer(Node):
         uturn_attempts = 0
         max_uturn_attempts = 2
 
+        # Define HSV color range for blue line detection
         lower_blue = np.array([95, 80, 40], dtype=np.uint8)
         upper_blue = np.array([140, 255, 255], dtype=np.uint8)
 
         kernel = np.ones((5, 5), np.uint8)
 
+        # Function to publish velocity commands
         def publish_cmd(v: float, w: float) -> None:
             msg = TwistStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
@@ -259,6 +261,7 @@ class RobotExplorer(Node):
             msg.twist.angular.z = float(w)
             self.cmd_vel_pub.publish(msg)
 
+        # Wait for the first camera image to be received
         start_time = self.get_clock().now()
         while rclpy.ok() and self._last_bgr is None:
             if (self.get_clock().now() - start_time).nanoseconds * 1e-9 > 2.0:
@@ -275,11 +278,13 @@ class RobotExplorer(Node):
             if img is None:
                 time.sleep(loop_dt)
                 continue
-
+            
+            # Only process the lower part of the image to focus on the area near the robot
             h, w, _ = img.shape
             y0 = int(h * 0.3)
             roi = img[y0:h, :]
 
+            # Convert to HSV color space and create a mask for the blue line
             img_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             mask = cv2.inRange(img_hsv, lower_blue, upper_blue)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -288,11 +293,15 @@ class RobotExplorer(Node):
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             contours = [c for c in contours if cv2.contourArea(c) >= min_area]
 
+            # If no blue line is detected, increment the lost time
             if not contours:
                 lost_time += loop_dt
                 publish_cmd(0.0, 0.0)
 
+                # If the line has been lost for too long, assume a dead end and attempt a U-turn
                 if lost_time >= lost_timeout_sec:
+
+                    # Allow a limited amount of U-turn attempts
                     if uturn_attempts < max_uturn_attempts:
                         self.get_logger().info("Line lost; turning around to continue following.")
                         for _ in range(3):
@@ -304,7 +313,8 @@ class RobotExplorer(Node):
                         lost_time = 0.0
                         time.sleep(loop_dt)
                         continue
-
+                    
+                    # If maximum U-turn attempts reached, assume the line is fully lost and exit
                     for _ in range(3):
                         publish_cmd(0.0, 0.0)
                         time.sleep(0.05)
@@ -313,12 +323,14 @@ class RobotExplorer(Node):
 
                 time.sleep(loop_dt)
                 continue
-
+            
+            # If the line is detected, reset the lost time and U-turn attempts
             lost_time = 0.0
             uturn_attempts = 0
             best = None
             best_cx = None
 
+            # Find the contour with the smallest x-coordinate of the centroid (leftmost)
             for c in contours:
                 M = cv2.moments(c)
                 if M['m00'] == 0:
@@ -328,22 +340,28 @@ class RobotExplorer(Node):
                     best = c
                     best_cx = cx
 
+            # If no valid contour is found, treat it as lost
             if best is None:
                 lost_time += loop_dt
                 publish_cmd(0.0, 0.0)
                 time.sleep(loop_dt)
                 continue
-
+            
+            # Compute the error in pixels between the centroid of the detected line 
+            # and the center of the image
             target_x = float(best_cx)
             center_x = float(w) / 2.0
             error_px = target_x - center_x
 
+            # Compute the angular velocity
             angular = -k_p * error_px
             angular = max(-max_angular_speed, min(max_angular_speed, angular))
 
+            # Compute the linear velocity
             speed_scale = max(0.3, 1.0 - abs(angular) / max_angular_speed)
             v = linear_speed * speed_scale
 
+            # Move the robot
             publish_cmd(v, angular)
             time.sleep(loop_dt)
 
