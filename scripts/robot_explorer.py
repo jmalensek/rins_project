@@ -190,6 +190,20 @@ class RobotExplorer(Node):
     def cover_waypoints(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0, localise: bool = True) -> None:
         for index, (x, y) in enumerate(waypoints):
 
+            if self.finished_count > 0:
+                self.get_logger().info("Interrupt signal received, waiting...")
+
+                # Publish a /finished message to signal interruption to other nodes
+                self.finished_pub.publish(Bool(data=True))
+                self.get_logger().info("Published /finished=True to signal interruption to other nodes.")
+
+                # Waits for the next /finished message to arrive
+                while self.finished_count < 2:
+                    rclpy.spin_once(self, timeout_sec=0.1)
+
+                self.get_logger().info("Resuming waypoint coverage...")
+                self.finished_count = 0
+
             # Compute the yaw angle to face at the next waypoint
             yaw = 0.0
             if index < len(waypoints) - 1:
@@ -213,12 +227,6 @@ class RobotExplorer(Node):
                 self.get_logger().error(f"Failed to reach ({x:.2f}, {y:.2f}) within timeout")
             else:
                 self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
-
-            # Check if 2 finished signal received, terminate exploration, and publish signal
-            if self.finished_count >= 2:
-                self.get_logger().info("Received /finished=True trigger twice, stopping exploration, publishing /finished=True trigger.")
-                self.finished_pub.publish(Bool(data=True))
-                return
 
     # Simple routine to localise the robot on the map
     def localise_self(self, turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0) -> None:
