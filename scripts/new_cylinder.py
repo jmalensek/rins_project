@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 
 import sensor_msgs_py.point_cloud2 as pc2
 from sensor_msgs.msg import PointCloud2, PointField
@@ -130,9 +131,18 @@ class CylinderSegmentation(Node):
 
         self.get_logger().info('cylinder_segmentation started')
 
-        # Declare and read parameter
+        # Declare and read parameters
         self.declare_parameter('topic_pointcloud_in', '/oakd/rgb/preview/depth/points')
+        self.declare_parameter('target_frame', 'map')
+        self.declare_parameter('tf_use_msg_stamp', False)
+        self.declare_parameter('tf_warn_throttle_sec', 2.0)
+
         topic_in = self.get_parameter('topic_pointcloud_in').get_parameter_value().string_value
+        self.target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
+        self.tf_use_msg_stamp = self.get_parameter('tf_use_msg_stamp').get_parameter_value().bool_value
+        self.tf_warn_throttle_sec = self.get_parameter('tf_warn_throttle_sec').get_parameter_value().double_value
+
+        self._last_tf_warn_ns = 0
 
         # TF
         self.tf_buffer = tf2_ros.Buffer()
@@ -155,11 +165,32 @@ class CylinderSegmentation(Node):
     def cloud_cb(self, msg: PointCloud2):
         now = msg.header.stamp
         from_frame = msg.header.frame_id
-        to_frame = 'map'
+        to_frame = self.target_frame
 
-        # ---- Convert PointCloud2 → numpy ----
-        gen = pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
-        points = np.array(list(gen), dtype=np.float32)  # (N, 3)
+        # ---- Convert PointCloud2 → numpy (Nx3 float32) ----
+        points = None
+
+        # Fast path (returns a numpy array, often with structured dtype)
+        read_points_numpy = getattr(pc2, 'read_points_numpy', None)
+        if callable(read_points_numpy):
+            arr = read_points_numpy(msg, field_names=('x', 'y', 'z'), skip_nans=True)
+            # `arr` can be (N,) structured with fields x/y/z
+            if getattr(arr.dtype, 'fields', None):
+                points = np.stack((arr['x'], arr['y'], arr['z']), axis=-1).astype(np.float32)
+            else:
+                points = np.asarray(arr, dtype=np.float32)
+
+        # Fallback: generator of tuples or structured records
+        if points is None:
+            gen = pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
+            pts = []
+            for p in gen:
+                # `p` may be a tuple/list OR a structured record
+                try:
+                    pts.append((float(p[0]), float(p[1]), float(p[2])))
+                except Exception:
+                    pts.append((float(p['x']), float(p['y']), float(p['z'])))
+            points = np.asarray(pts, dtype=np.float32)
 
         if len(points) == 0:
             self.get_logger().warn('Received empty point cloud.')
@@ -188,7 +219,7 @@ class CylinderSegmentation(Node):
         detected_cylinders = 0
         marker_id = 0
 
-        while detected_cylinders <= MAX_DETECTED_CYLINDERS:
+        while detected_cylinders < MAX_DETECTED_CYLINDERS:
             if len(remaining) < MIN_CYLINDER_SIZE:
                 break
 
@@ -218,10 +249,16 @@ class CylinderSegmentation(Node):
             point_camera.point.z = float(MARKER_HEIGHT)
 
             try:
-                transform = self.tf_buffer.lookup_transform(to_frame, from_frame, now)
-                point_map = tf2_geometry_msgs.do_transform_point(point_camera, transform)
+                # Using the message stamp often causes TF extrapolation if clocks are slightly skewed.
+                tf_time = Time.from_msg(now) if self.tf_use_msg_stamp else Time()
+                transform = self.tf_buffer.lookup_transform(to_frame, from_frame, tf_time)
+                point_out = tf2_geometry_msgs.do_transform_point(point_camera, transform)
             except tf2_ros.TransformException as ex:
-                self.get_logger().warn(str(ex))
+                now_ns = self.get_clock().now().nanoseconds
+                throttle_ns = int(max(0.1, float(self.tf_warn_throttle_sec)) * 1e9)
+                if now_ns - self._last_tf_warn_ns > throttle_ns:
+                    self._last_tf_warn_ns = now_ns
+                    self.get_logger().warn(f"TF lookup failed ({from_frame} -> {to_frame}): {ex}")
                 break
 
             # ---- Accept cylinder if within margin and large enough ----
@@ -234,7 +271,7 @@ class CylinderSegmentation(Node):
 
                 # Publish marker
                 marker = Marker()
-                marker.header.frame_id = 'map'
+                marker.header.frame_id = to_frame
                 marker.header.stamp = now
                 marker.ns = 'cylinder'
                 marker.id = marker_id
@@ -243,8 +280,8 @@ class CylinderSegmentation(Node):
                 marker.type = Marker.CYLINDER
                 marker.action = Marker.ADD
 
-                marker.pose.position.x = point_map.point.x
-                marker.pose.position.y = point_map.point.y
+                marker.pose.position.x = point_out.point.x
+                marker.pose.position.y = point_out.point.y
                 marker.pose.position.z = MARKER_HEIGHT / 2.0
                 marker.pose.orientation.w = 1.0
 
@@ -257,7 +294,7 @@ class CylinderSegmentation(Node):
                 marker.color.b = 0.0
                 marker.color.a = 1.0
 
-                marker.lifetime.nanosec = 1  # ~1 ns (effectively immediate)
+                marker.lifetime.sec = 2
 
                 self.marker_pub.publish(marker)
 
