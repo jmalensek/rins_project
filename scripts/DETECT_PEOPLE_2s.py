@@ -27,6 +27,7 @@ from tf2_geometry_msgs import do_transform_point
 from geometry_msgs.msg import PoseStamped
 
 from std_msgs.msg import String
+from visualization_msgs.msg import Marker
 
 from RECOGNIZE_PEOPLE_2s import PeopleRecognizer
 from robot_commander import RobotCommander
@@ -64,11 +65,13 @@ class detect_faces(Node):
 		self.faces = []  # list of dicts: {cx, cy, bbox}
 
 		# tracked locations (map frame):
-		# {"x": float, "y": float, "done": bool, "n": int, "sum_x": float, "sum_y": float}
+		# {"x": float, "y": float, "done": bool, "n": int, "sum_x": float, "sum_y": float, "marker_published": bool}
 		self.tracks = []
 
 		# Notify other nodes (e.g., QR scanning) when we have arrived at a person
 		self.current_person_pub = self.create_publisher(String, "/current_person", 10)
+		# RViz marker for stabilized person locations (map frame)
+		self.marker_pub = self.create_publisher(Marker, "/face_markers", 10)
 
 		self._pending_goal = None
 		self._pending_track = None
@@ -92,6 +95,31 @@ class detect_faces(Node):
 
 		model_path = os.path.join(self.package_share_dir, MODEL_PATH)
 		self.model = YOLO(model_path)
+
+	def _publish_person_marker(self, person_id: int, x: float, y: float, z: float = 0.0) -> None:
+		msg = Marker()
+		msg.header.frame_id = "map"
+		msg.header.stamp = self.get_clock().now().to_msg()
+		msg.ns = "detected_people"
+		msg.id = int(person_id)
+		msg.type = Marker.SPHERE
+		msg.action = Marker.ADD
+
+		msg.pose.position.x = float(x)
+		msg.pose.position.y = float(y)
+		msg.pose.position.z = float(z) + 0.25
+		msg.pose.orientation.w = 1.0
+
+		msg.scale.x = 0.25
+		msg.scale.y = 0.25
+		msg.scale.z = 0.25
+
+		msg.color.r = 1.0
+		msg.color.g = 0.2
+		msg.color.b = 0.1
+		msg.color.a = 0.9
+
+		self.marker_pub.publish(msg)
 
 	def _is_visited(self, x_map: float, y_map: float) -> bool:
 		r2 = float(self.merge_radius_m) * float(self.merge_radius_m)
@@ -287,7 +315,7 @@ class detect_faces(Node):
 		self.rc.goToPose(self._pending_goal)
 
 	def pointcloud_callback(self, data):
-		if self.latest_image is None or self.recognizer is None:
+		if self.latest_image is None:
 			return
 		if not self.faces:
 			return
@@ -359,13 +387,19 @@ class detect_faces(Node):
 					self._remember_visited(float(self.tracks[track_ix].get("x", 0.0)), float(self.tracks[track_ix].get("y", 0.0)))
 					continue
 			else:
-				self.tracks.append({"x": x1, "y": y1, "done": False, "n": 0, "sum_x": 0.0, "sum_y": 0.0})
+				self.tracks.append({"x": x1, "y": y1, "done": False, "n": 0, "sum_x": 0.0, "sum_y": 0.0, "marker_published": False})
 				track_ix = len(self.tracks) - 1
 				self._add_location_sample(track_ix, x1, y1)
 
 			# if this track isn't done yet, make sure we go to it (but never spam the same goal)
 			if not self.tracks[track_ix].get("done"):
 				if int(self.tracks[track_ix].get("n", 0)) >= int(self.min_location_samples):
+					# Stabilized mean (running average) is now available: publish marker once, then approach.
+					if not bool(self.tracks[track_ix].get("marker_published", False)):
+						self._publish_person_marker(int(track_ix), float(self.tracks[track_ix]["x"]), float(self.tracks[track_ix]["y"]), 0.0)
+						self.tracks[track_ix]["marker_published"] = True
+						self.get_logger().info(
+							f"Track#{track_ix} stabilized (n={int(self.tracks[track_ix].get('n', 0))}). Published marker + queuing approach.")
 					# Use averaged location for the goal
 					self._queue_navigation(track_ix, float(self.tracks[track_ix]["x"]), float(self.tracks[track_ix]["y"]))
 
