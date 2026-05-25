@@ -64,7 +64,7 @@ class detect_tiles(Node):
         self.scan = None
         self.load_model()
 
-        self.image_sub = self.create_subscription(Image, "/top_camera/preview/image_raw", self.image_callback, qos_profile_sensor_data)
+        self.image_sub = self.create_subscription(Image, "/top_camera/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
 
         self.tiles = {
                 'total': 0,
@@ -97,7 +97,7 @@ class detect_tiles(Node):
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
         # thresholding - treba prilagoditi vrednosti po potrebi
-        _, binanry = cv2.threshold(blurred, 100, 2, 55, cv2.THRESH_BINARY)
+        _, binary = cv2.threshold(blurred, 100, 255, cv2.THRESH_BINARY)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
@@ -137,8 +137,9 @@ class detect_tiles(Node):
         return warped
     
     def predict_anomaly(self, tile_image):
-
-        return
+        # Placeholder until the anomaly model is wired in.
+        # Return a valid tuple so the rest of the pipeline can continue.
+        return False, 0.0
 
     def get_tile_center(self, contour):
         """Calculate the center point of a tile contour"""
@@ -152,6 +153,8 @@ class detect_tiles(Node):
 
     # callback ko prejme sliko iz top kamere
     def image_callback(self, msg):
+
+        self.get_logger().info("Received image from top camera")
 
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
