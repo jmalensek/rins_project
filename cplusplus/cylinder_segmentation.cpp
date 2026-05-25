@@ -34,12 +34,28 @@
 #include <vector>
 #include <string>
 #include <sstream>
+#include <cstdlib>
 
 /*
 ZA DODAT:
 - to potem publisha na nek topic
 - za preverit kako se orientacijo zamenja - se pravi X ali Y axis?
 */
+
+// Function to play text-to-speech alert
+static void say(const std::string& message) {
+    try {
+
+        std::string cmd = "espeak \"" + message + "\" 2>/dev/null &";
+        
+        int result = std::system(cmd.c_str());
+        if (result != 0 && verbose) {
+            std::cerr << "Warning: Text-to-speech may have failed (exit code: " << result << ")" << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error in say: " << e.what() << std::endl;
+    }
+}
 
 rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr viz_image_pub;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr planes_pub;
@@ -718,6 +734,10 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
                             color_name_h);
 
                         const bool is_leaking = leak.leaking;
+
+                        if (is_leaking) {
+                            say("Alert, Alert, warning, the barrel is leaking");
+                        }
 
                         const SaveResult save_result_h = upsertCylinder(
                             now, point_map_h.point, color_name_h, color_stats_h, "HORIZONTAL", is_leaking);
