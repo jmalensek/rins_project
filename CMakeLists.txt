@@ -82,6 +82,7 @@ install(PROGRAMS
   scripts/RECOGNIZE_PEOPLE_2s.py
   scripts/greet_people_2s.py
   scripts/new_cylinder.py
+  scripts/tile_detection.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
