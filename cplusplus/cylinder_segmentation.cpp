@@ -42,6 +42,8 @@ ZA DODAT:
 - za preverit kako se orientacijo zamenja - se pravi X ali Y axis?
 */
 
+bool verbose = true; // debug outout
+
 // Function to play text-to-speech alert
 static void say(const std::string& message) {
     try {
@@ -76,7 +78,6 @@ int image_width = 640, image_height = 480;
 // parameters
 float error_margin = 0.04;  // 4 cm margin for radius error
 float target_radius = 0.11; // 11cm radius
-bool verbose = true; // debug outout
 
 // cloud filtering
 float x_limit_low = 0; // only process points 0-3m in X direction
