@@ -71,7 +71,6 @@ install(FILES
 install(PROGRAMS
   scripts/detect_people.py
   scripts/DETECT_PEOPLE_2s.py
-  scripts/QR_NODE_2s.py
   scripts/robot_commander.py
   scripts/robot_explorer.py
   scripts/detect_people2.py
@@ -80,8 +79,8 @@ install(PROGRAMS
   scripts/greet_people_faster.py
   scripts/cylinder_detection.py
   scripts/RECOGNIZE_PEOPLE_2s.py
-  scripts/greet_people_2s.py
   scripts/new_cylinder.py
+  scripts/detect_yellow_line.py
   scripts/tile_detection.py
   DESTINATION lib/${PROJECT_NAME})
 
