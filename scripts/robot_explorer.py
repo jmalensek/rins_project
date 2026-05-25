@@ -55,6 +55,7 @@ class RobotExplorer(Node):
         self.amcl_pose_msg = None
         self._amcl_window = deque()
         self.localisation_streak = 0
+        self.yellow_detected = False
 
         self._last_bgr = None
 
@@ -76,7 +77,8 @@ class RobotExplorer(Node):
         self.create_subscription(OccupancyGrid, 'map', self._map_callback, map_qos)
         self.create_subscription(Bool, '/finished', self._finished_callback, 10)
         self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._amcl_pose_callback, 10)
-        self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self._image_callback, image_qos)
+        self.create_subscription(Image, "/top_camera/rgb/preview/image_raw", self._image_callback, image_qos)
+        self.create_subscription(Bool, '/yellow_line/detected', self._yellow_line_callback, 10)
 
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
 
@@ -158,6 +160,24 @@ class RobotExplorer(Node):
 
     # Moves the robot to a specific pose on the map using Nav2's navigate_to_pose action
     def go_to_pose(self, x: float, y: float, yaw: float = 0.0) -> bool:
+        if self.map_data is not None:
+            map_cell = self._world_to_map(x, y)
+            if map_cell is None:
+                self.get_logger().warn(f"Goal ({x:.2f}, {y:.2f}) is outside the known map")
+                return False
+
+        # If a yellow line has been detected, avoid sending navigation goals
+        if getattr(self, 'yellow_detected', False):
+            self.get_logger().warn(f"Yellow line detected; refusing to send goal to ({x:.2f}, {y:.2f})")
+            return False
+
+            mx, my = map_cell
+            if self._cell(mx, my) != 0:
+                self.get_logger().warn(
+                    f"Goal ({x:.2f}, {y:.2f}) is not in free space (map cell value: {self._cell(mx, my)})"
+                )
+                return False
+
         # Wait for Nav2 action server
         while not self.nav_to_pose_client.wait_for_server(timeout_sec=1.0):
             self.get_logger().info("Waiting for navigate_to_pose action server...")
@@ -223,7 +243,7 @@ class RobotExplorer(Node):
                 self.get_logger().error(f"Failed to send goal to ({x:.2f}, {y:.2f})")
                 continue
             
-            if not self.wait_task_done(timeout_sec=10.0):
+            if not self.wait_task_done(timeout_sec=30.0):
                 self.get_logger().error(f"Failed to reach ({x:.2f}, {y:.2f}) within timeout")
             else:
                 self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
@@ -240,21 +260,20 @@ class RobotExplorer(Node):
     # Follows a blue line on the ground
     # The line possibly branches out, so the robot should follow the leftmost branch
     # and return when the line ends
+    # IMPORTANT: Set the arm position to look_for_qr
     def follow_blue_line(
         self,
         linear_speed: float = 0.2,
         max_angular_speed: float = 0.5,
         k_p: float = 0.004,
         min_area: int = 500,
-        lost_timeout_sec: float = 5.0,
+        lost_timeout_sec: float = 2.0,
         loop_dt: float = 0.1,
-        fork_look_angle: float = math.pi / 4.0,
         ) -> None:
         self.get_logger().info("Starting to follow the blue line...")
 
         uturn_attempts = 0
-        max_uturn_attempts = 2
-        fork_active = False
+        max_uturn_attempts = 4
 
         # Define HSV color range for blue line detection
         lower_blue = np.array([95, 80, 40], dtype=np.uint8)
@@ -289,9 +308,9 @@ class RobotExplorer(Node):
                 time.sleep(loop_dt)
                 continue
             
-            # Only process the lower part of the image to focus on the area near the robot
+            # Only process the lower part of the image to focus on the area near the robot.
             h, w, _ = img.shape
-            y0 = int(h * 0.9)
+            y0 = int(h * 0.77) # 0.77 kind of works fine with the look_for_qr camera pose
             roi = img[y0:h, :]
 
             # Convert to HSV color space and create a mask for the blue line
@@ -302,16 +321,6 @@ class RobotExplorer(Node):
 
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             contours = [c for c in contours if cv2.contourArea(c) >= min_area]
-
-            if len(contours) >= 2:
-                if not fork_active:
-                    fork_active = True
-                    self.get_logger().info(
-                        f"Fork detected; inspecting left and right by {fork_look_angle:.2f} rad"
-                    )
-                    self._inspect_fork(fork_look_angle, max_angular_speed)
-            else:
-                fork_active = False
 
             # If no blue line is detected, increment the lost time
             if not contours:
@@ -328,7 +337,7 @@ class RobotExplorer(Node):
                             publish_cmd(0.0, 0.0)
                             time.sleep(0.05)
 
-                        self.turn(math.pi, angular_speed=max(0.2, max_angular_speed))
+                        self.turn(math.pi/2, angular_speed=max(0.2, max_angular_speed))
                         uturn_attempts += 1
                         lost_time = 0.0
                         time.sleep(loop_dt)
@@ -350,13 +359,13 @@ class RobotExplorer(Node):
             best = None
             best_cx = None
 
-            # Find the contour with the largest x-coordinate of the centroid (rightmost)
+            # Find the contour with the smallest x-coordinate of the centroid (leftmost)
             for c in contours:
                 M = cv2.moments(c)
                 if M['m00'] == 0:
                     continue
                 cx = int(M['m10'] / M['m00'])
-                if best is None or cx > best_cx:
+                if best is None or cx < best_cx:
                     best = c
                     best_cx = cx
 
@@ -385,27 +394,10 @@ class RobotExplorer(Node):
             publish_cmd(v, angular)
             time.sleep(loop_dt)
 
-    # Stops the robot and looks left/right around a fork before resuming normal motion.
-    def _inspect_fork(self, look_angle: float, angular_speed: float) -> None:
-        stop_msg = TwistStamped()
-        for _ in range(3):
-            stop_msg.header.stamp = self.get_clock().now().to_msg()
-            stop_msg.header.frame_id = 'base_link'
-            self.cmd_vel_pub.publish(stop_msg)
-            time.sleep(0.05)
-
-        self.turn(abs(look_angle), angular_speed=max(0.2, angular_speed))
-        time.sleep(0.2)
-        self.turn(-abs(look_angle), angular_speed=max(0.2, angular_speed))
-        time.sleep(0.2)
-        self.turn(-abs(look_angle), angular_speed=max(0.2, angular_speed))
-        time.sleep(0.2)
-        self.turn(abs(look_angle), angular_speed=max(0.2, angular_speed))
-
     # NAVIGATION HELPER METHODS
 
     # Makes a grid of points using two opposing corner bounds
-    def generate_grid(self, corner1: tuple[float, float], corner2: tuple[float, float], step: float = 0.5) -> list[tuple[float,float]]:
+    def generate_grid(self, corner1: tuple[float, float], corner2: tuple[float, float], step: float = 1.0) -> list[tuple[float,float]]:
         x1, y1 = corner1
         x2, y2 = corner2
 
@@ -416,12 +408,20 @@ class RobotExplorer(Node):
 
         grid_points = []
         y = min_y
+        row_index = 0
         while y <= max_y:
+            row_points = []
             x = min_x
             while x <= max_x:
-                grid_points.append((x, y))
+                row_points.append((x, y))
                 x += step
+
+            if row_index % 2 == 1:
+                row_points.reverse()
+
+            grid_points.extend(row_points)
             y += step
+            row_index += 1
 
         return grid_points
 
@@ -605,6 +605,13 @@ class RobotExplorer(Node):
         if len(self._amcl_window) > 20:
             self._amcl_window.popleft()
 
+    def _yellow_line_callback(self, msg: Bool) -> None:
+        # store latest detection state
+        try:
+            self.yellow_detected = bool(msg.data)
+        except Exception:
+            self.get_logger().warn('Received malformed /yellow_line/detected message')
+
     def _image_callback(self, msg: Image) -> None:
         try:
             encoding = (msg.encoding or "").lower()
@@ -667,8 +674,8 @@ def main(args = None):
     #re.localise_self()
 
     # hardcoded waypoints for the specific map
-    area1_lower_left_bound = (-4.50756475184462, 0.0182652945804538)
-    area1_upper_right_bound = (0.7969508957012219, -4.426747521850663)
+    area1_lower_bound = (0.7719925413173669, -4.4194223905944074)
+    area1_upper_bound = (-4.644132348851085, 0.27827839427878537)
     blue_line_start = (2.797641390882936, 0.19569027139125528)
 
     waypoints_task1_sim = [(1.8396370262122645, -0.5751383533952286),
@@ -694,7 +701,8 @@ def main(args = None):
                     (-2.9581028006218273, -0.8952083394225052),
                     (-3.3163698668480146, -1.275044404810225)]
 
-    waypoints_task2_sim_area1 = re.generate_grid(area1_lower_left_bound, area1_upper_right_bound, step=0.2)
+    waypoints_task2_sim_area1 = re.generate_grid(area1_lower_bound, area1_upper_bound, step=2.0)
+    print(f"Generated {len(waypoints_task2_sim_area1)} waypoints for area 1")
 
     #re.cover_waypoints(waypoints_task2_sim_area1, localise=False)
     re.follow_blue_line()
