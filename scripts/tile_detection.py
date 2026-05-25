@@ -10,6 +10,17 @@ mora tudi shraniti koliko ploščic je - se pravi število ploščic ki imajo an
 
 
 imamo tudi kamero: top_camera
+
+število ploščic je toliko da so od enega konca linije do drugega
+
+da hkrati laufata cell detection in tile detection node
+
+da si explerer zapomni koordinate rdečih /zelenih cellov, pa potem se vklopi 
+cell detection, kjer poišče en konec linije, pa se počasi premika do drugega konca
+
+najprej gre na desni konec, kamero pa ma gor na desno stran
+
+ko dobi task - preko topica dobi kateri cell mora obiskat
 '''
 
 
@@ -46,6 +57,9 @@ class detect_tiles(Node):
         self.tile_size = self.get_parameter('tile_size').get_parameter_value().integer_value
         self.confidence_threshold = self.get_parameter('confidence_threshold').get_parameter_value().double_value
 
+        self.last_processed_tile_center = None
+        self.tile_center_threshold = 50  # pixels
+
         self.bridge = CvBridge()
         self.scan = None
         self.load_model()
@@ -68,7 +82,8 @@ class detect_tiles(Node):
             print(f"spd-say not found. Would say: {text}")
 
     def load_model(self):
-        return
+        model = None
+        return model
 
     def print_detected_tiles(self):
         print(f"Total tiles: {self.tiles['total']}")
@@ -125,6 +140,16 @@ class detect_tiles(Node):
 
         return
 
+    def get_tile_center(self, contour):
+        """Calculate the center point of a tile contour"""
+        M = cv2.moments(contour)
+        if M['m00'] != 0:
+            cx = int(M['m10'] / M['m00'])
+            cy = int(M['m01'] / M['m00'])
+            return (cx, cy)
+        return None
+
+
     # callback ko prejme sliko iz top kamere
     def image_callback(self, msg):
 
@@ -144,6 +169,22 @@ class detect_tiles(Node):
             return
         self.get_logger().info(f"Detected {len(tiles_contours)} tiles in the image.")
 
+        # Take the most prominent/largest tile (or center tile)
+        largest_tile = max(tiles_contours, key=cv2.contourArea)
+        center = self.get_tile_center(largest_tile)
+        
+        if center is None:
+            return
+        
+        # Skip if it's the same tile as last frame
+        if self.last_processed_tile_center is not None:
+            distance = np.sqrt((center[0] - self.last_processed_tile_center[0])**2 + 
+                            (center[1] - self.last_processed_tile_center[1])**2)
+            if distance < self.tile_center_threshold:
+                return  # Same tile, skip
+        
+        # New tile detected
+        self.last_processed_tile_center = center
         # za vsako ploščico:
         for idx, contour in enumerate(tiles_contours):
 
@@ -153,7 +194,7 @@ class detect_tiles(Node):
                 
                 cv2.imshow(f"Warped Tile {idx}", warped_tile)
                 cv2.waitKey(1)
-                
+
                 is_anomaly, confidence = self.predict_anomaly(warped_tile)
 
                 self.tiles['total'] += 1
