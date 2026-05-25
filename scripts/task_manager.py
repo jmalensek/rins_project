@@ -55,8 +55,6 @@ TASK_KEYWORDS = {
     "Counting rings":         ["ring",   "rings",   "count rings", "circles"],
     "Anomaly detection":         ["tiles", "anomaly", "cell", "anomalies"],
 }
-
-DEFAULT_TASK = "Anomaly detection"
 MIN_TASK_SCORE = 0.45
 
 
@@ -106,7 +104,8 @@ def classify_task(raw: str) -> tuple[str, float]:
     tokens = _tokenize(text)
 
     if not text:
-        return (DEFAULT_TASK if DEFAULT_TASK in TASK_KEYWORDS else next(iter(TASK_KEYWORDS)), 0.0)
+        # Nothing to classify
+        return (next(iter(TASK_KEYWORDS)), 0.0)
 
     # Exact keyword substring match => high confidence
     for task, keywords in TASK_KEYWORDS.items():
@@ -128,7 +127,7 @@ def classify_task(raw: str) -> tuple[str, float]:
                             return (task, 0.85)
 
     # Soft fallback: score all tasks
-    best_task = DEFAULT_TASK if DEFAULT_TASK in TASK_KEYWORDS else next(iter(TASK_KEYWORDS))
+    best_task: str | None = None
     best_score = 0.0
 
     for task, keywords in TASK_KEYWORDS.items():
@@ -144,11 +143,11 @@ def classify_task(raw: str) -> tuple[str, float]:
                     for kw_tok in kw_tokens:
                         score = max(score, SequenceMatcher(None, t, kw_tok).ratio())
 
-        if score > best_score:
+        if best_task is None or score > best_score:
             best_score = score
             best_task = task
 
-    return best_task, best_score
+    return (best_task or next(iter(TASK_KEYWORDS))), best_score
 
 
 
@@ -283,9 +282,9 @@ class TaskNode(Node):
             self._mic_suppressed_until = time.monotonic() + 0.6
 
 
-    def _listen_for_categorized_task(self, *, max_attempts: int = 3) -> str | None:
-        """Listen and return a canonical task; ask to repeat if unclear."""
-        for attempt in range(max_attempts):
+    def _listen_for_categorized_task(self) -> str | None:
+        """Listen until we can confidently categorize into TASK_KEYWORDS."""
+        while rclpy.ok():
             raw = self._listen_for_task_voice()
             if raw is None:
                 return None
@@ -296,10 +295,8 @@ class TaskNode(Node):
             if score >= MIN_TASK_SCORE:
                 return task
 
-            # If unclear, prompt and retry
-            if attempt < max_attempts - 1:
-                self.say("I did not catch that, can you please repeat?")
-                time.sleep(0.2)
+            self.say("I didn't catch that, can you please repeat?")
+            time.sleep(2)
 
         return None
 
@@ -432,10 +429,10 @@ class TaskNode(Node):
             f"Hello {name}."
             f"What task should I perform? "
         )
-        time.sleep(6)
+        time.sleep(3)
 
         # Poslušaj odgovor
-        task = self._listen_for_categorized_task(max_attempts=3)
+        task = self._listen_for_categorized_task()
         if task is None:
             self.get_logger().warn(f"No task received for {name}.")
             return
@@ -448,7 +445,7 @@ class TaskNode(Node):
             undecided = True
             while undecided:
                 self.say(f"You want me to perform {task}. Are you sure?")
-                time.sleep(0.3)
+                time.sleep(3)
                 raw = self._listen_for_task_voice()
                 if raw is None:
                     self.get_logger().warn(f"No task received for {name}.")
@@ -461,7 +458,7 @@ class TaskNode(Node):
                 else:
                     new_task, score = classify_task(raw)
                     if score < MIN_TASK_SCORE:
-                        self.say("I did not catch that, can you please repeat?")
+                        self.say("I didn't catch that, can you please repeat?")
                         time.sleep(0.2)
                         continue
                     task = new_task
