@@ -29,7 +29,7 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String, Bool
 from visualization_msgs.msg import Marker
 
-from RECOGNIZE_PEOPLE_2s import PeopleRecognizer
+from recognize_people_2s import PeopleRecognizer
 from robot_commander import RobotCommander
 
 MODEL_PATH = "yolo26n-face.pt"
@@ -70,6 +70,19 @@ class detect_faces(Node):
 		self.latest_image = None
 		self.faces = []  # list of dicts: {cx, cy, bbox}
 
+		# Expand the drawn bbox so it frames the whole portrait/picture, not only the face.
+		# These are multipliers of the detected face bbox size.
+		self.draw_pad_left = 1.0
+		self.draw_pad_right = 1.0
+		self.draw_pad_top = 0.7
+		self.draw_pad_bottom = 2.7
+
+		# Lightweight live recognition label (updated at most every N seconds)
+		self.live_recognition = True
+		self._live_recog_period_s = 0.6
+		self._last_live_recog_t = 0.0
+		self._live_label = None  # (name, gender) or None
+
 		# tracked locations (map frame):
 		# {"x": float, "y": float, "done": bool, "n": int, "sum_x": float, "sum_y": float, "marker_published": bool}
 		self.tracks = []
@@ -103,6 +116,23 @@ class detect_faces(Node):
 
 		model_path = os.path.join(self.package_share_dir, MODEL_PATH)
 		self.model = YOLO(model_path)
+
+	def _expand_bbox_for_draw(self, bbox, image_shape):
+		x1, y1, x2, y2 = bbox
+		h, w = image_shape[:2]
+		bw = max(1, int(x2 - x1))
+		bh = max(1, int(y2 - y1))
+		dx1 = int(self.draw_pad_left * bw)
+		dx2 = int(self.draw_pad_right * bw)
+		dy1 = int(self.draw_pad_top * bh)
+		dy2 = int(self.draw_pad_bottom * bh)
+		nx1 = max(0, int(x1) - dx1)
+		ny1 = max(0, int(y1) - dy1)
+		nx2 = min(w - 1, int(x2) + dx2)
+		ny2 = min(h - 1, int(y2) + dy2)
+		if nx2 <= nx1 or ny2 <= ny1:
+			return (int(x1), int(y1), int(x2), int(y2))
+		return (int(nx1), int(ny1), int(nx2), int(ny2))
 
 	def _publish_person_marker(self, person_id: int, x: float, y: float, z: float = 0.0) -> None:
 		msg = Marker()
@@ -170,8 +200,18 @@ class detect_faces(Node):
 
 					#self.get_logger().info("Person has been detected!")
 
-					# draw rectangle
-					cv_image = cv2.rectangle(cv_image,(int(bbox[0]), int(bbox[1])),(int(bbox[2]), int(bbox[3])),self.detection_color,3)
+					x1 = int(bbox[0]); y1 = int(bbox[1]); x2 = int(bbox[2]); y2 = int(bbox[3])
+					face_bbox = (x1, y1, x2, y2)
+					draw_bbox = self._expand_bbox_for_draw(face_bbox, cv_image.shape)
+
+					# draw expanded rectangle (frames the whole portrait/picture)
+					cv_image = cv2.rectangle(
+						cv_image,
+						(int(draw_bbox[0]), int(draw_bbox[1])),
+						(int(draw_bbox[2]), int(draw_bbox[3])),
+						self.detection_color,
+						3,
+					)
 
 					cx = int((bbox[0] + bbox[2]) / 2)
 					cy = int((bbox[1] + bbox[3]) / 2)
@@ -179,8 +219,44 @@ class detect_faces(Node):
 					# draw the center of bounding box
 					cv_image = cv2.circle(cv_image, (cx, cy), 5, self.detection_color, -1)
 
-					x1 = int(bbox[0]); y1 = int(bbox[1]); x2 = int(bbox[2]); y2 = int(bbox[3])
-					self.faces.append({"cx": cx, "cy": cy, "bbox": (x1, y1, x2, y2)})
+					self.faces.append({"cx": cx, "cy": cy, "bbox": face_bbox, "draw_bbox": draw_bbox})
+
+			# Optional: run lightweight live recognition (label overlay), throttled.
+			if self.live_recognition and self.recognizer is not None and self.faces:
+				now = time.monotonic()
+				if (now - float(self._last_live_recog_t)) >= float(self._live_recog_period_s):
+					self._last_live_recog_t = now
+					face = max(self.faces, key=lambda f: (f["bbox"][2] - f["bbox"][0]) * (f["bbox"][3] - f["bbox"][1]))
+					crop = self._crop_bbox(self.latest_image, face["bbox"])
+					label = None
+					if crop is not None:
+						try:
+							result = self.recognizer.recognize(crop)
+						except Exception:
+							result = None
+						if result is not None and result.get("name"):
+							label = (result.get("name"), result.get("gender"))
+					self._live_label = label
+
+			# Draw label above each bbox (if available)
+			if self._live_label is not None:
+				name, gender = self._live_label
+				label_text = f"{name} ({gender})" if gender else f"{name}"
+				for f in self.faces:
+					draw_bbox = f.get("draw_bbox") or f.get("bbox")
+					x1, y1, x2, y2 = [int(v) for v in draw_bbox]
+					tx = x1
+					ty = max(0, y1 - 10)
+					cv2.putText(
+						cv_image,
+						label_text,
+						(tx, ty),
+						cv2.FONT_HERSHEY_SIMPLEX,
+						0.7,
+						self.detection_color,
+						2,
+						cv2.LINE_AA,
+					)
 
 			# If we're at a person, try recognition on every RGB frame (no extra waiting)
 			if self._recognizing_track is not None and self.recognizer is not None and self.faces:
@@ -194,6 +270,7 @@ class detect_faces(Node):
 							if result is not None and result.get("name"):
 								name = result.get("name")
 								gender = result.get("gender")
+								self._live_label = (name, gender)
 								self.tracks[track_ix]["done"] = True
 								self._remember_visited(float(self.tracks[track_ix].get("x", 0.0)), float(self.tracks[track_ix].get("y", 0.0)))
 								msg = String()
