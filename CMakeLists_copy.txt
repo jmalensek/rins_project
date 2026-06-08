@@ -38,6 +38,21 @@ link_directories(${PCL_LIBRARY_DIRS})
 
 set(dependencies rclcpp std_msgs std_srvs geometry_msgs sensor_msgs visualization_msgs tf2 tf2_geometry_msgs pcl_conversions message_filters cv_bridge)
 
+add_executable(cylinder_segmentation cplusplus/cylinder_segmentation.cpp)
+ament_target_dependencies(cylinder_segmentation ${dependencies})
+
+
+target_link_libraries(cylinder_segmentation
+  ${Boost_SYSTEM_LIBRARY}
+  ${PCL_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+)
+
+install(TARGETS
+  cylinder_segmentation
+  DESTINATION lib/${PROJECT_NAME}/
+)
+
 install(DIRECTORY
   launch
   config
@@ -48,19 +63,23 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}/
 )
 
+install(FILES
+  yolo26n-face.pt
+  embeddings.json
+  DESTINATION share/${PROJECT_NAME}/
+)
 
 install(PROGRAMS
-  scripts/detect_people1_robot.py
-  scripts/detect_people2_robot.py
   scripts/detect_people.py
+  scripts/DETECT_PEOPLE_2s.py
   scripts/robot_commander.py
   scripts/robot_explorer.py
   scripts/detect_people2.py
   scripts/detect_rings27.py
   scripts/greet_people.py
-  scripts/greet_people1_robot.py
   scripts/greet_people_faster.py
   scripts/cylinder_detection.py
+  scripts/RECOGNIZE_PEOPLE_2s.py
   scripts/new_cylinder.py
   scripts/detect_yellow_line.py
   scripts/tile_detection.py

@@ -57,7 +57,7 @@ class detect_faces(Node):
 		self.detections = []    # [person_id][x,y,z]  2D array
 		self.coords_published = False
 		self.face_t = 0.7
-		self.n_faces = 10
+		self.n_faces = 5
 		self.camera_intrinsics = None # To store camera intrinsic parameters
 		self.depth_units_converted = False  # Flag to log depth unit conversion once
 
@@ -113,19 +113,16 @@ class detect_faces(Node):
 			depth_frame_id = depth_msg.header.frame_id
 			depth_timestamp = depth_msg.header.stamp
 
-			# Check depth units and convert if necessary (check once)
-			if not self.depth_units_converted:
-				# If median depth > 100, assume values are in millimeters
-				valid_depths = depth_image[depth_image > 0.1]
-				if len(valid_depths) > 0:
-					median_depth = np.median(valid_depths)
-					if median_depth > 100:
-						# Convert from millimeters to meters
-						depth_image = depth_image / 1000.0
-						self.get_logger().info("Depth image converted from millimeters to meters")
-					else:
-						self.get_logger().info(f"Depth values appear to be in meters (median: {median_depth:.3f}m)")
-				self.depth_units_converted = True
+			# If median depth > 100, assume values are in millimeters
+			valid_depths = depth_image[depth_image > 0.1]
+			if len(valid_depths) > 0:
+				median_depth = np.median(valid_depths)
+				if median_depth > 100:
+					# Convert from millimeters to meters
+					depth_image = depth_image / 1000.0
+					self.get_logger().info("Depth image converted from millimeters to meters")
+				else:
+					self.get_logger().info(f"Depth values appear to be in meters (median: {median_depth:.3f}m)")
 
 			# Run YOLO inference for face detection
 			res = self.model.predict(cv_image, imgsz=(256, 320), show=False, verbose=False, device=self.device)
@@ -212,9 +209,12 @@ class detect_faces(Node):
 			self.get_logger().warn("Could not get stable depth at detection center.")
 			return
 
-		if not np.isfinite(distance) or distance <= 0.1:
+		if not np.isfinite(distance) or distance <= 0.1 or distance > 2.0:
 			self.get_logger().warn(f"Invalid distance from depth image: {distance}")
 			return
+
+		self.get_logger().info(f"DEPTH = {distance}")
+
 
 		# Use camera intrinsics to project 2D pixel to 3D point in camera frame
 		cam_fx = self.camera_intrinsics['fx']
@@ -261,6 +261,8 @@ class detect_faces(Node):
 
 		n = len(self.detections)
 		person_id = n  # Default: assume new person
+
+		self.publish_person_marker(person_id, x, y, z)
 
 		# Try to match with existing persons using median position
 		for p_id in range(n):

@@ -7,6 +7,7 @@ from std_msgs.msg import Bool
 import time
 import math
 import subprocess
+from std_msgs.msg import String
 
 from robot_commander import RobotCommander
 
@@ -24,19 +25,23 @@ class greet_people(Node):
         # Start greeting only after two /finished triggers
         self.create_subscription(Bool, '/finished', self.finished_callback, 10)
 
+        # za robot speaking
+        self.speak_pub = self.create_publisher(String, "/speak", 10)
+
         self.queue = []
         self.greet_started = False
         self.processing = False
         self.finished = False
 
+        self.n_finished = 1
         self.finished_true_count = 0
 
-        self.n_persons = 3
+        self.n_persons = 5
         self.stop_distance = 0.65
 
         self.get_logger().info("Node started. Waiting for people detections...")
 
-        self.text = ["Smile", "Hair", "Eyes"]
+        self.text = ["Smile", "Hair", "Eyes", "Hairstyle", "Style", "Everything"]
         self.person_ix = 0
 
 
@@ -61,7 +66,7 @@ class greet_people(Node):
     def maybe_start_greeting(self):
         if self.greet_started:
             return
-        if len(self.queue) < self.n_persons or self.finished_true_count < 3:
+        if len(self.queue) < self.n_persons or self.finished_true_count < self.n_finished:
             return
         if not self.rc.initial_pose_received:
             self.get_logger().warn(
@@ -134,7 +139,7 @@ class greet_people(Node):
             time.sleep(0.5)
 
         # say something
-        self.say(f"Hello person, I like your {self.text[self.person_ix]}!")
+        self.speak(f"Hello person, I like your {self.text[self.person_ix]}!")
         time.sleep(4)
         self.person_ix += 1
 
@@ -145,6 +150,12 @@ class greet_people(Node):
             subprocess.run(["spd-say", "-r", "-60", "-p", "-55", "-t", "male3", text], check=False)
         except FileNotFoundError:
             print(f"spd-say not found. Would say: {text}")
+
+    def speak(self, text):
+        msg = String()
+        msg.data = text
+        self.speak_pub.publish(msg)
+        self.get_logger().info(f'Said: "{text}"')
         
 
 
@@ -154,12 +165,15 @@ def main():
 
     rc.waitUntilNav2Active()
 
+    """
     while rc.is_docked is None:
         rclpy.spin_once(rc, timeout_sec=0.5)
 
     if rc.is_docked:
         rc.undock()
+    """
 
+    print("Node starting")
     node = greet_people(rc)
 
     while rclpy.ok():
