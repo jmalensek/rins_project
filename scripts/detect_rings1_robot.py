@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 
-# HAVE TO DETECT TWO RINGS AND THEIR COLOR
+# HAVE TO DETECT FOUR RINGS AND THEIR COLOR
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
@@ -22,10 +22,7 @@ from tf2_geometry_msgs import do_transform_point
 from std_msgs.msg import Bool, String
 
 
-class detect_rings(Node):
-
-
-    
+class detect_rings(Node):  
 
     def __init__(self):
         super().__init__('detect_rings')
@@ -80,9 +77,9 @@ class detect_rings(Node):
         self.rings = []
         # clustering
         self.ring_clusters = []
-        self.cluster_threshold = 0.50  # 50 centimers
+        self.cluster_threshold = 0.50  # 50 centimeters
 
-        self.min_detections = 8  # min hits before publishing a marker
+        self.min_detections = 5  # min hits before publishing a marker
 
         self.ema_alpha = 0.1  # EMA smoothing factor for centroid
 
@@ -124,7 +121,7 @@ class detect_rings(Node):
                 exit()
 
             circles = cv2.HoughCircles(gray_upper, cv2.HOUGH_GRADIENT, dp=1.0, minDist=50,
-                                     param1=200, param2=45, minRadius=3, maxRadius=100)  # params could be changed
+                                     param1=200, param2=40, minRadius=3, maxRadius=100)  # params could be changed
 # maybe change param2 si it would depend also on radius? smaller radius -> smaller threshold for detection?
             if circles is not None:
                 circles_draw = np.uint16(np.around(circles[0, :]))
@@ -235,7 +232,7 @@ class detect_rings(Node):
         map_x = float(point_map.point.x)
         map_y = float(point_map.point.y)
         map_z = float(point_map.point.z)
-        self.get_logger().info(f"Ring {color['name'] if color else 'unknown'} at map coordinates: ({map_x:.2f}, {map_y:.2f})")
+        self.get_logger().info(f"Ring {color['name']} at map coordinates: ({map_x:.2f}, {map_y:.2f})")
         self.add_to_clusters(map_x, map_y, map_z, color)
 
     def _get_valid_depth(self, depth_dx, depth_dy, ring_radius, min_outer_radius=6):
@@ -311,7 +308,7 @@ class detect_rings(Node):
                 cluster["last_seen"] = now_sec
 
                 if cluster["count"] == self.min_detections and not cluster.get("spoken", True):
-                    name = (cluster.get("color") or {}).get("name", "unknown")
+                    name = (cluster.get("color") or {}).get("name")
                     
                     self.speaking_pub.publish(String(data=f"{name} ring"))
                     #self.say(f"{name} ring")
@@ -385,7 +382,6 @@ class detect_rings(Node):
                 name = color["name"]
             else:
                 r_val, g_val, b_val = 0.0, 1.0, 1.0
-                name = "unknown"
     
             marker.color.r = r_val
             marker.color.g = g_val
@@ -517,7 +513,7 @@ class detect_rings(Node):
         labels = [self.classify_lab(L, A, B) for L, A, B in pixels]
     
         # Count votes for valid ring colors only
-        ring_colors = {"red", "green", "blue", "black", "yellow", "white"}
+        ring_colors = {"red", "green", "blue", "black"}
         counts = {}
         for label in labels:
             if label in ring_colors:
@@ -554,17 +550,13 @@ class detect_rings(Node):
         if chroma < 15:
             if L < 15:
                 return "black"
-            elif L > 95:
-                return "white"
     
         # --- Chromatic colors — use hue angle ---
         hue = np.degrees(np.arctan2(B, A)) % 360
 
-        if hue < 42 or hue >= 300:
+        if hue < 60 or hue >= 300:
             return "red"
-        elif 42 <= hue < 75:
-            return "yellow"
-        elif 75 <= hue < 145:
+        elif 60 <= hue < 145:
             # Extra guard: true green has positive B, blue has negative B
             if B > 0 and A < 10:
                 return "green"
