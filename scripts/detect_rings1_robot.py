@@ -74,7 +74,7 @@ class detect_rings(Node):
         # ZA DODAT PUBLISHERHJA NA /SPEAK TOPIC, ???
         self.speaking_pub = self.create_publisher(String, "/speak", 10)
 
-        self.marker_pub = self.create_publisher(Marker, marker_topic, QoSReliabilityPolicy.RELIABLE)
+        self.marker_pub = self.create_publisher(Marker, marker_topic, 10)
         self.finished_pub = self.create_publisher(Bool, "/finished", 10)
 
         self.rings = []
@@ -82,7 +82,7 @@ class detect_rings(Node):
         self.ring_clusters = []
         self.cluster_threshold = 0.50  # 50 centimers
 
-        self.min_detections = 10  # min hits before publishing a marker
+        self.min_detections = 8  # min hits before publishing a marker
 
         self.ema_alpha = 0.1  # EMA smoothing factor for centroid
 
@@ -291,10 +291,6 @@ class detect_rings(Node):
         if not (self.MAP_Z_MIN <= cz <= self.MAP_Z_MAX):
             self.get_logger().warn(f"Centroid z={cz:.2f} out of map bounds, skipping.")
             return False
-        depth = np.sqrt(cx**2 + cy**2 + cz**2)
-        if not (self.MIN_DEPTH <= depth <= self.MAX_DEPTH):
-            self.get_logger().warn(f"Centroid depth={depth:.2f}m out of valid range, skipping.")
-            return False
         return True
 
 
@@ -327,12 +323,15 @@ class detect_rings(Node):
                 cluster["centroid"] = ((1 - self.ema_alpha) * old + self.ema_alpha * new_point).tolist()
                 
                 # update the color similarly to centroid
-                if color and cluster.get("color"):
-                    old_lab = np.array(cluster["color"]["lab"])
-                    new_lab = np.array(color["lab"])
-                    smoothed_lab = (1 - self.ema_alpha) * old_lab + self.ema_alpha * new_lab
-                    L, A, B = smoothed_lab
-                    cluster["color"] = {"lab": smoothed_lab.tolist(), "name": self.classify_lab(L, A, B)}
+                if color:
+                    if cluster.get("color") is None:
+                        cluster["color"] = color
+                    else:
+                        old_lab = np.array(cluster["color"]["lab"])
+                        new_lab = np.array(color["lab"])
+                        smoothed_lab = (1 - self.ema_alpha) * old_lab + self.ema_alpha * new_lab
+                        L, A, B = smoothed_lab
+                        cluster["color"] = {"lab": smoothed_lab.tolist(), "name": self.classify_lab(L, A, B)}
 
                 return
 
@@ -398,7 +397,7 @@ class detect_rings(Node):
             if name not in self.detected_colors:
                 self.detected_colors.add(name)
     
-            if len(self.detected_colors) >= 10:  # was 10, but you said 4 rings
+            if len(self.detected_colors) >= 4:
                 self.get_logger().info(
                     f"Detected 4 rings with colors: {', '.join(self.detected_colors)}. "
                     f"Publishing finished signal."
@@ -432,24 +431,77 @@ class detect_rings(Node):
         # Optionally filter by depth consistency —
         # pixels on the ring rim should all be at roughly the same depth
         if self.depth_image is not None:
-            depth_patch = self.depth_image[y0:y1, x0:x1].astype(float)
-    
-            # Convert mm → m where needed
-            depth_patch = np.where(depth_patch > 20.0, depth_patch / 1000.0, depth_patch)
-    
-            # Only keep finite, plausible depth values inside annulus
-            depth_valid = np.isfinite(depth_patch) & (depth_patch > 0.1) & (depth_patch < 10.0)
-            annulus_depths = depth_patch[annulus_mask & depth_valid]
-    
-            if annulus_depths.size > 5:
-                # Estimate ring depth as median of annulus depths
-                ring_depth = np.median(annulus_depths)
-    
-                # Keep only pixels whose depth is within a tight tolerance of the ring plane
-                tolerance = max(0.05, 0.10 * ring_depth)  # 10% of distance, min 5cm
-                depth_consistent = np.abs(depth_patch - ring_depth) < tolerance
-                annulus_mask = annulus_mask & depth_valid & depth_consistent
-    
+
+            depth_h, depth_w = self.depth_image.shape[:2]
+
+            rgb_w = self.rgb_w if self.rgb_w else depth_w
+            rgb_h = self.rgb_h if self.rgb_h else depth_h
+
+            # convert RGB patch coordinates to depth coordinates
+            dx0 = int(x0 * depth_w / rgb_w)
+            dx1 = int(x1 * depth_w / rgb_w)
+            dy0 = int(y0 * depth_h / rgb_h)
+            dy1 = int(y1 * depth_h / rgb_h)
+
+            dx0 = max(0, dx0)
+            dx1 = min(depth_w, dx1)
+            dy0 = max(0, dy0)
+            dy1 = min(depth_h, dy1)
+
+            if dx1 > dx0 and dy1 > dy0:
+
+                depth_patch = self.depth_image[dy0:dy1, dx0:dx1].astype(float)
+
+                # convert mm → m
+                depth_patch = np.where(
+                    depth_patch > 20.0,
+                    depth_patch / 1000.0,
+                    depth_patch
+                )
+
+                # recreate annulus mask in depth-image coordinates
+                rows_d, cols_d = np.ogrid[dy0:dy1, dx0:dx1]
+
+                depth_cx = cx * depth_w / rgb_w
+                depth_cy = cy * depth_h / rgb_h
+
+                outer_radius_d = outer_radius * depth_w / rgb_w
+                inner_radius_d = inner_radius * depth_w / rgb_w
+
+                dist_d = np.hypot(cols_d - depth_cx, rows_d - depth_cy)
+
+                depth_annulus_mask = (
+                    (dist_d >= inner_radius_d) &
+                    (dist_d <= outer_radius_d)
+                )
+
+                depth_valid = (
+                    np.isfinite(depth_patch) &
+                    (depth_patch > 0.1) &
+                    (depth_patch < 10.0)
+                )
+
+                annulus_depths = depth_patch[
+                    depth_annulus_mask & depth_valid
+                ]
+
+                if annulus_depths.size > 5:
+
+                    ring_depth = np.median(annulus_depths)
+
+                    tolerance = max(0.05, 0.10 * ring_depth)
+
+                    depth_consistent = (
+                        np.abs(depth_patch - ring_depth)
+                        < tolerance
+                    )
+
+                    depth_annulus_mask = (
+                        depth_annulus_mask &
+                        depth_valid &
+                        depth_consistent
+                    )
+            
         # Extract color patch and convert to LAB
         roi = cv_image[y0:y1, x0:x1]
         img_float = roi.astype(np.float32) / 255.0
@@ -504,13 +556,11 @@ class detect_rings(Node):
                 return "black"
             elif L > 95:
                 return "white"
-            else:
-                return "unknown"
     
         # --- Chromatic colors — use hue angle ---
         hue = np.degrees(np.arctan2(B, A)) % 360
 
-        if hue < 42 or hue >= 330:
+        if hue < 42 or hue >= 300:
             return "red"
         elif 42 <= hue < 75:
             return "yellow"
@@ -521,10 +571,9 @@ class detect_rings(Node):
             elif B <= 5:
                 return "blue"   # shifted blue caught in green range
             return "green"
-        elif 145 <= hue < 260:
+        elif 145 <= hue < 300:
             return "blue"
-        else:
-            return "unknown"
+
 
 
     def lab_to_marker_rgb(self, lab):
