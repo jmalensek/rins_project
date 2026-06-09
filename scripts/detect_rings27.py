@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 
-# HAVE TO DETECT TWO RINGS AND THEIR COLOR
+# spremenjen file za task 2
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
