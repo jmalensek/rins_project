@@ -130,37 +130,6 @@ class RobotExplorer(Node):
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
 
-    # Moves the robot straight ahead at a given speed until it either detects an obstacle or a yellow line
-    def move_in_area1(self, speed: float = 0.2, timeout_sec: float = 30.0) -> None:
-        speed = abs(speed)
-
-        twist_msg = TwistStamped()
-        twist_msg.twist.linear.x = speed
-
-        stop_msg = TwistStamped()
-
-        start_time = self.get_clock().now()
-        while (self.get_clock().now() - start_time).nanoseconds < timeout_sec * 1e9:
-            if self.yellow_detected:
-                self.get_logger().info("Yellow line detected; stopping movement.")
-                break
-
-            #if self.scan_data and min(self.scan_data.ranges) < 0.5:
-            #   self.get_logger().info("Obstacle detected; stopping movement.")
-            #   break
-
-            twist_msg.header.stamp = self.get_clock().now().to_msg()
-            twist_msg.header.frame_id = 'base_link'
-            self.cmd_vel_pub.publish(twist_msg)
-            rclpy.spin_once(self, timeout_sec=0.0)
-            time.sleep(0.1)
-
-        for _ in range(3):
-            stop_msg.header.stamp = self.get_clock().now().to_msg()
-            stop_msg.header.frame_id = 'base_link'
-            self.cmd_vel_pub.publish(stop_msg)
-            time.sleep(0.05)
-
     # Turns the robot in place by a given angle (in radians) at a given angular speed
     def turn(self, angle: float, angular_speed: float = 0.5) -> None:
         if angle is None:
@@ -199,6 +168,48 @@ class RobotExplorer(Node):
             for _ in range(turns):
                 self.turn(angle, angular_speed)
                 time.sleep(wait_time)
+
+     # Moves the robot straight ahead at a given speed until it either detects an obstacle or a yellow line
+    def move_in_area1(self, speed: float = 0.2, obst_range: float = 0.5, timeout_sec: float = 30.0) -> None:
+        speed = abs(speed)
+
+        twist_msg = TwistStamped()
+        twist_msg.twist.linear.x = speed
+
+        stop_msg = TwistStamped()
+
+        start_time = self.get_clock().now()
+        while (self.get_clock().now() - start_time).nanoseconds < timeout_sec * 1e9:
+
+            # If a yellow line is detected, stop
+            if self.yellow_detected:
+                self.get_logger().info("Yellow line detected; stopping movement.")
+                break
+            
+            # If an obstacle is detected straight ahead (check narrow wedge of middle ranges) within a given range, stop
+            if self.scan_data is not None:
+                # Check the middle ranges for obstacles
+                len_ranges = len(self.scan_data.ranges)
+                middle_ranges = [
+                    self.scan_data.ranges[i] for i in range(len_ranges//2 - 10, len_ranges//2 + 10) 
+                    if not math.isinf(self.scan_data.ranges[i])
+                    ]
+                
+                if min(middle_ranges) < obst_range:
+                    self.get_logger().info("Obstacle detected; stopping movement.")
+                    break
+
+            twist_msg.header.stamp = self.get_clock().now().to_msg()
+            twist_msg.header.frame_id = 'base_link'
+            self.cmd_vel_pub.publish(twist_msg)
+            rclpy.spin_once(self, timeout_sec=0.0)
+            time.sleep(0.1)
+
+        for _ in range(3):
+            stop_msg.header.stamp = self.get_clock().now().to_msg()
+            stop_msg.header.frame_id = 'base_link'
+            self.cmd_vel_pub.publish(stop_msg)
+            time.sleep(0.05)
 
     # Moves the robot to a specific pose on the map using Nav2's navigate_to_pose action
     def go_to_pose(self, x: float, y: float, yaw: float = 0.0) -> bool:
@@ -248,6 +259,10 @@ class RobotExplorer(Node):
         return True
 
     # NAVIGATION METHODS
+
+
+    def explore_area1(self, speed: float = 0.2, angular_speed: float = 1.0, timeout_sec: float = 120.0) -> None:
+        self.get_logger().info("Starting exploration of area 1...")
 
     # Sequentially visits a set of waypoints on a provided map
     def cover_waypoints(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0, localise: bool = True) -> None:
