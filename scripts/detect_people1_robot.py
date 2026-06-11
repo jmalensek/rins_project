@@ -10,7 +10,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 import rclpy.duration
 
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 
 from geometry_msgs.msg import PointStamped
 
@@ -59,14 +59,14 @@ class detect_faces(Node):
 		self.detections = []  # [person_id] = {'B': [...], 'A': [...]}
 		self.coords_published = False
 		self.face_t = 0.7
-		self.n_faces = 6
+		self.n_faces = 5
 		self.face_radius = 0.3
-		self.detect_distance = 0.7  # Maximum distance to record robot position, in meters
+		self.detect_distance = 0.85  # Maximum distance to record robot position, in meters
 		self.camera_intrinsics = None # To store camera intrinsic parameters
 		self.depth_units_converted = False  # Flag to log depth unit conversion once
 
 		# RGB subscriber with queue
-		rgb_sub = message_filters.Subscriber(self, Image, "/gemini/color/image_raw")
+		rgb_sub = message_filters.Subscriber(self, CompressedImage, "/gemini/color/image_raw/compressed")
 		# Depth subscriber with queue
 		depth_sub = message_filters.Subscriber(self, Image, "/gemini/depth/image_raw")
 		# Temporal synchronizer with 0.05s slop tolerance and queue size of 10
@@ -134,7 +134,16 @@ class detect_faces(Node):
 		# Synchronized callback for temporally-aligned RGB and depth messages.
 		# This ensures face detection and depth lookup are from the same instant in time.
 		try:
-			cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+			# 1. Pretvori podatke iz CompressedImage v numpy polje
+			np_arr = np.frombuffer(rgb_msg.data, np.uint8)
+			
+			# 2. Dekompresiraj sliko neposredno v BGR format (OpenCV)
+			cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+			
+			if cv_image is None:
+				self.get_logger().error("Dekompresija slike ni uspela.")
+				return
+
 			(h, w) = cv_image.shape[:2]
 
 			# Convert depth image (32-bit floating point)
