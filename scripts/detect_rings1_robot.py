@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+# ideja, če se v enem runnu ne detektira vseh reči, se lahko naredi reverse run
+# da gre še enkrat po vseh waypointih, samo in reversed order. lahko se tudi naredi, da samo detect
+# faces publisha finished signal, pa se takrat zažene greet_people
+
 
 # HAVE TO DETECT FOUR RINGS AND THEIR COLOR
 import rclpy
@@ -166,7 +170,7 @@ class detect_rings(Node):
                     self.rings.append((cx, cy, r, color))
                     self.process_ring_center(cx, cy, r, color)
 
-            cv2.imshow("rings", cv_image)
+            cv2.imshow("rings", cv_image[:self.rgb_h // 2, :])
             key = cv2.waitKey(1)
             if key == 27:
                 print("exiting")
@@ -188,6 +192,8 @@ class detect_rings(Node):
         self.depth_cy = float(msg.k[5])
 
     def process_ring_center(self, cx, cy, r, color):
+        if self.rgb_h and cy > self.rgb_h // 2:
+            return 
         if self.depth_image is None or self.depth_frame_id is None:
             self.get_logger().warn("Depth image not available yet; skipping ring")
             return
@@ -406,6 +412,8 @@ class detect_rings(Node):
             
     def detect_ring_color(self, cv_image, cx, cy, r):
         h_img, w_img = cv_image.shape[:2]
+        if cy > h_img // 2:
+            return None   # ← add this
     
         # Annulus bounds — same logic as depth sampling
         outer_radius = int(1.05 * r)
