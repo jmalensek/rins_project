@@ -170,11 +170,13 @@ class RobotExplorer(Node):
                 time.sleep(wait_time)
 
      # Moves the robot straight ahead at a given speed until it either detects an obstacle or a yellow line
-    def move_in_area1(self, speed: float = 0.2, obst_range: float = 0.5, timeout_sec: float = 30.0) -> None:
+    def move_in_area1(self, speed: float = 0.2, obst_range: float = 0.5, range_sample_n: int = 10,timeout_sec: float = 30.0) -> None:
         speed = abs(speed)
 
         twist_msg = TwistStamped()
         twist_msg.twist.linear.x = speed
+
+        n_half = range_sample_n//2
 
         stop_msg = TwistStamped()
 
@@ -191,7 +193,7 @@ class RobotExplorer(Node):
                 # Check the middle ranges for obstacles
                 len_ranges = len(self.scan_data.ranges)
                 middle_ranges = [
-                    self.scan_data.ranges[i] for i in range(len_ranges//2 - 10, len_ranges//2 + 10) 
+                    self.scan_data.ranges[i] for i in range(len_ranges//2 - n_half, len_ranges//2 + n_half) 
                     if not math.isinf(self.scan_data.ranges[i])
                     ]
                 
@@ -260,9 +262,18 @@ class RobotExplorer(Node):
 
     # NAVIGATION METHODS
 
-
     def explore_area1(self, speed: float = 0.2, angular_speed: float = 1.0, timeout_sec: float = 120.0) -> None:
         self.get_logger().info("Starting exploration of area 1...")
+
+        start_time = self.get_clock().now()
+
+        # Move straight ahead until an obstacle or yellow line is detected, then turn left/right and repeat until timeout
+        while rclpy.ok() and (self.get_clock().now() - start_time).nanoseconds < timeout_sec * 1e9:
+            self.get_logger().info("Moving ahead...")
+            self.move_in_area1(speed=speed, timeout_sec=timeout_sec)
+
+            self.get_logger().info("Turning to explore new direction...")
+            self.turn(math.pi/2, angular_speed=angular_speed)
 
     # Sequentially visits a set of waypoints on a provided map
     def cover_waypoints(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0, localise: bool = True) -> None:
