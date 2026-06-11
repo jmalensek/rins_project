@@ -42,7 +42,7 @@ class RobotExplorer(Node):
         
         self.pose_frame_id = 'map'
         
-        # Flags and helper variables
+        # FLAGS AND STATE VARIABLES
         self.goal_handle = None
         self.result_future = None
         self.feedback = None
@@ -68,16 +68,30 @@ class RobotExplorer(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Publishers
+        # PUBLISHERS
+        # Publisher for velocity commands to control the robot's movement
         self.cmd_vel_pub = self.create_publisher(TwistStamped, 'cmd_vel', 10)
+
+        # Publisher to signal finish or interruption to other nodes
         self.finished_pub = self.create_publisher(Bool, "/finished", 10)
 
-        # Subscribers
+        # SUBSCRIBERS
+        # Laser scan data for obstacle detection and navigation
         self.create_subscription(LaserScan, 'scan_filtered', self._scan_callback, qos_profile_sensor_data)
+
+        # Occupancy grid map data for navigation and waypoint generation
         self.create_subscription(OccupancyGrid, 'map', self._map_callback, map_qos)
+
+        # Finished signal for interruption mechanisms
         self.create_subscription(Bool, '/finished', self._finished_callback, 10)
+
+        # AMCL pose estimates for localisation and navigation feedback
         self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._amcl_pose_callback, 10)
+
+        # Camera images for line following and visual processing
         self.create_subscription(Image, "/top_camera/rgb/preview/image_raw", self._image_callback, image_qos)
+
+        # Subscription for yellow line detection
         self.create_subscription(Bool, '/yellow_line/detected', self._yellow_line_callback, 10)
 
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
@@ -94,6 +108,7 @@ class RobotExplorer(Node):
             return
         
         speed = abs(speed)
+        
         duration = distance / speed
 
         twist_msg = TwistStamped()
@@ -115,14 +130,41 @@ class RobotExplorer(Node):
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
 
+    # Moves the robot straight ahead at a given speed until it either detects an obstacle or a yellow line
+    def move_in_area1(self, speed: float = 0.2, timeout_sec: float = 30.0) -> None:
+        speed = abs(speed)
+
+        twist_msg = TwistStamped()
+        twist_msg.twist.linear.x = speed
+
+        stop_msg = TwistStamped()
+
+        start_time = self.get_clock().now()
+        while (self.get_clock().now() - start_time).nanoseconds < timeout_sec * 1e9:
+            if self.yellow_detected:
+                self.get_logger().info("Yellow line detected; stopping movement.")
+                break
+
+            #if self.scan_data and min(self.scan_data.ranges) < 0.5:
+            #   self.get_logger().info("Obstacle detected; stopping movement.")
+            #   break
+
+            twist_msg.header.stamp = self.get_clock().now().to_msg()
+            twist_msg.header.frame_id = 'base_link'
+            self.cmd_vel_pub.publish(twist_msg)
+            rclpy.spin_once(self, timeout_sec=0.0)
+            time.sleep(0.1)
+
+        for _ in range(3):
+            stop_msg.header.stamp = self.get_clock().now().to_msg()
+            stop_msg.header.frame_id = 'base_link'
+            self.cmd_vel_pub.publish(stop_msg)
+            time.sleep(0.05)
+
     # Turns the robot in place by a given angle (in radians) at a given angular speed
     def turn(self, angle: float, angular_speed: float = 0.5) -> None:
         if angle is None:
             self.get_logger().warn("Turn angle is None; skipping turn command")
-            return
-
-        if angular_speed <= 0:
-            self.get_logger().error("Angular speed must be positive")
             return
             
         angular_speed = abs(angular_speed)
@@ -160,23 +202,24 @@ class RobotExplorer(Node):
 
     # Moves the robot to a specific pose on the map using Nav2's navigate_to_pose action
     def go_to_pose(self, x: float, y: float, yaw: float = 0.0) -> bool:
-        if self.map_data is not None:
-            map_cell = self._world_to_map(x, y)
-            if map_cell is None:
-                self.get_logger().warn(f"Goal ({x:.2f}, {y:.2f}) is outside the known map")
-                return False
 
-        # If a yellow line has been detected, avoid sending navigation goals
-        if getattr(self, 'yellow_detected', False):
-            self.get_logger().warn(f"Yellow line detected; refusing to send goal to ({x:.2f}, {y:.2f})")
+        # Check if mapa data is available before sending the goal
+        if self.map_data is None:
+            self.get_logger().error("Map data is not available")
             return False
 
-            mx, my = map_cell
-            if self._cell(mx, my) != 0:
-                self.get_logger().warn(
-                    f"Goal ({x:.2f}, {y:.2f}) is not in free space (map cell value: {self._cell(mx, my)})"
+        # Check if the goal is within the map bounds and in free space before sending the goal
+        map_cell = self._world_to_map(x, y)
+        if map_cell is None:
+            self.get_logger().warn(f"Goal ({x:.2f}, {y:.2f}) is outside the known map")
+            return False
+
+        mx, my = map_cell
+        if self._cell(mx, my) != 0:
+            self.get_logger().warn(
+                f"Goal ({x:.2f}, {y:.2f}) is not in free space (map cell value: {self._cell(mx, my)})"
                 )
-                return False
+            return False
 
         # Wait for Nav2 action server
         while not self.nav_to_pose_client.wait_for_server(timeout_sec=1.0):
@@ -423,6 +466,9 @@ class RobotExplorer(Node):
             y += step
             row_index += 1
 
+        # Reverse the order of the points
+        grid_points.reverse()
+
         return grid_points
 
     # Computes the yaw between two absolute poses
@@ -593,20 +639,29 @@ class RobotExplorer(Node):
 
     # CALLBACKS
     def _scan_callback(self, msg: LaserScan) -> None:
-        self.scan_data = msg
+        try:
+            self.scan_data = msg
+        except Exception:
+            self.get_logger().warn('Received malformed scan message')
 
     def _map_callback(self, msg: OccupancyGrid) -> None:
-        self.map_data = msg
+        try:
+            self.map_data = msg
+        except Exception:
+            self.get_logger().warn('Received malformed map message')
 
     def _finished_callback(self, msg: Bool) -> None:
         if msg.data:
             self.finished_count += 1
 
     def _amcl_pose_callback(self, msg: PoseWithCovarianceStamped) -> None:
-        self.amcl_pose_msg = msg
-        self._amcl_window.append(msg)
-        if len(self._amcl_window) > 20:
-            self._amcl_window.popleft()
+        try:
+            self.amcl_pose_msg = msg
+            self._amcl_window.append(msg)
+            if len(self._amcl_window) > 20:
+                self._amcl_window.popleft()
+        except Exception:
+            self.get_logger().warn('Received malformed amcl_pose message')
 
     def _yellow_line_callback(self, msg: Bool) -> None:
         # store latest detection state
@@ -727,13 +782,20 @@ def main(args = None):
     #waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=1.5)
     #print(f"Generated {len(waypoints_task2_sim_area1)} waypoints for area 1")
 
+    #re.turn(2 * math.pi)
+    #re.move_in_area1(speed=0.2, timeout_sec=30.0)
+    #re.turn(math.pi/2)
+    #re.move_in_area1(speed=0.2, timeout_sec=30.0)
+
     # TASK 2
-    re.cover_waypoints(waypoints_task2_sim_area1, localise=False)
-    re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
+    # For line detection run detect_yellow_line.py and arm_mover_actions.py
+    # For best view of both the yellow and blue line 
+    #re.cover_waypoints(waypoints_task2_sim_area1, localise=False)
+    #re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
     #re.follow_blue_line()
 
     # TASK 1R
-    #re.cover_waypoints(waypoints_irl, wait_time=0.5, localise=True)
+    re.cover_waypoints(waypoints_irl, wait_time=0.5, localise=True)
     
     re.get_logger().info("Exploration complete, shutting down.")
     re.destroy_node()
