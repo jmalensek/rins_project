@@ -10,7 +10,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
 
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import PointStamped
@@ -67,7 +67,7 @@ class detect_rings(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # ZA SPREMENIT TA RGB IMAGE IN DEPTH IMAGE - V DIS_TUTORIAL6 SO MOŽNI TOPICI
-        self.rgb_image_sub = self.create_subscription(Image, "/gemini/color/image_raw", self.rgb_callback, qos_profile_sensor_data)
+        self.rgb_image_sub = self.create_subscription(CompressedImage, "/gemini/color/image_raw/compressed", self.rgb_callback, qos_profile_sensor_data)
         self.depth_image_sub = self.create_subscription(Image, "/gemini/depth/image_raw", self.depth_callback, qos_profile_sensor_data)
         self.depth_info_sub = self.create_subscription(CameraInfo, "/gemini/depth/camera_info", self.depth_info_callback, qos_profile_sensor_data)
         self.get_logger().info("Subscribed to RGB image and depth image topics.")
@@ -106,7 +106,16 @@ class detect_rings(Node):
         self.rings = []
 
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            # 1. Pretvori podatke iz CompressedImage v numpy polje
+            np_arr = np.frombuffer(data.data, np.uint8)
+
+            # 2. Dekompresiraj sliko neposredno v BGR format (OpenCV)
+            cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+            if cv_image is None:
+                self.get_logger().error("Dekompresija slike ni uspela.")
+                return
+
             self.rgb_h, self.rgb_w = cv_image.shape[:2]
 
             #self.get_logger().info(f"Running Hough Circle detection...")
@@ -359,8 +368,8 @@ class detect_rings(Node):
             cx, cy, cz = cluster["centroid"]
     
             # Validate position before publishing
-            if not self._is_valid_position(cx, cy, cz):
-                continue
+            #if not self._is_valid_position(cx, cy, cz):
+               # continue
     
             self.get_logger().info(
                 f"Publishing marker for cluster {i} at ({cx:.2f}, {cy:.2f}, {cz:.2f}) "
