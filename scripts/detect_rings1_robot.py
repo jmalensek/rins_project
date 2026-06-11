@@ -83,7 +83,7 @@ class detect_rings(Node):
         self.ring_clusters = []
         self.cluster_threshold = 0.50  # 50 centimeters
 
-        self.min_detections = 5  # min hits before publishing a marker
+        self.min_detections = 15  # min hits before publishing a marker
 
         self.ema_alpha = 0.1  # EMA smoothing factor for centroid
 
@@ -125,7 +125,7 @@ class detect_rings(Node):
                 exit()
 
             circles = cv2.HoughCircles(gray_upper, cv2.HOUGH_GRADIENT, dp=1.0, minDist=50,
-                                     param1=200, param2=40, minRadius=3, maxRadius=100)  # params could be changed
+                                     param1=200, param2=45, minRadius=3, maxRadius=100)  # params could be changed
 # maybe change param2 si it would depend also on radius? smaller radius -> smaller threshold for detection?
             if circles is not None:
                 circles_draw = np.uint16(np.around(circles[0, :]))
