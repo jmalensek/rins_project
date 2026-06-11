@@ -28,6 +28,8 @@ import numpy as np
 import cv2
 from sensor_msgs.msg import Image
 
+from std_msgs.msg import String
+
 map_qos = QoSProfile(
     durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
     reliability=QoSReliabilityPolicy.RELIABLE,
@@ -93,6 +95,9 @@ class RobotExplorer(Node):
 
         # Subscription for yellow line detection
         self.create_subscription(Bool, '/yellow_line/detected', self._yellow_line_callback, 10)
+
+        # za govor
+        self.speak_pub = self.create_publisher(String, "/speak", 10)
 
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
 
@@ -301,6 +306,7 @@ class RobotExplorer(Node):
                 yaw = self.compute_absolute_yaw(waypoints[index - 1], (x, y))
 
             self.get_logger(). info(f"Navigating to waypoint ({x:.2f}, {y:.2f}) with yaw {yaw:.2f} rad")
+            self.speak(f"Navigating to new location.")
 
             # Rotate to help with localisation
             if localise:
@@ -742,6 +748,12 @@ class RobotExplorer(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to convert image without cv_bridge: {e}")
 
+    def speak(self, text):
+        msg = String()
+        msg.data = text
+        self.speak_pub.publish(msg)
+        self.get_logger().info(f'Said: "{text}"')
+
 def main(args = None):
 
     rclpy.init(args=args)
@@ -830,3 +842,5 @@ def main(args = None):
 
 if __name__=="__main__":
     main()
+
+

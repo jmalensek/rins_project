@@ -25,6 +25,7 @@ from tf2_geometry_msgs import do_transform_point
 from geometry_msgs.msg import PoseStamped
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Bool
+from std_msgs.msg import String
 
 # Message synchronization for temporal alignment of RGB and depth
 import message_filters
@@ -40,6 +41,9 @@ class detect_faces(Node):
 			parameters=[
 				('device', ''),
 		])
+
+		# za robot speaking
+		self.speak_pub = self.create_publisher(String, "/speak", 10)
 
 		faces_topic = "/face_detections"
 
@@ -337,6 +341,7 @@ class detect_faces(Node):
 		if is_new_person:
 			self.detections.append({'B': [], 'A': []})
 			self.get_logger().info(f"New person found! (ID {person_id})")
+			self.speak(f"I found a new person!")
 
 		# Store both coordinates: store full A pose including quaternion
 		self.detections[person_id]['B'].append([bx, by, bz])  # Face position
@@ -349,6 +354,12 @@ class detect_faces(Node):
 		# Check if we have detected enough people to publish results
 		if len(self.detections) >= self.n_faces and not self.coords_published:
 			self.publish_people()
+
+	def speak(self, text):
+		msg = String()
+		msg.data = text
+		self.speak_pub.publish(msg)
+		self.get_logger().info(f'Said: "{text}"')
 
 
 	def publish_person_marker(self, person_id, x, y, z):

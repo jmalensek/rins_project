@@ -46,7 +46,7 @@ class greet_people(Node):
 
         self.get_logger().info("Node started. Waiting for people detections...")
 
-        self.text = ["Smile", "Hair", "Eyes", "Hairstyle", "Style", "Everything"]
+        self.text = ["Smile", "Hair", "Eyes", "Hairstyle", "Everything"]
         self.person_ix = 0
 
 
@@ -138,8 +138,14 @@ class greet_people(Node):
             time.sleep(0.5)
 
         # say something
-        self.speak(f"Hello person, I like your {self.text[self.person_ix]}!")
+        self.speak(f"Hello person {self.person_ix}, I like your {self.text[self.person_ix]}!")
         time.sleep(4)
+
+        # Pri prvi in drugi osebi (person_ix == 0 ali 1) se robot najprej obrne za 180°,
+        # preden nadaljuje proti naslednji točki.
+        if self.person_ix in (0, 1):
+            self.spin_180()
+
         self.person_ix += 1
 
 
@@ -156,6 +162,16 @@ class greet_people(Node):
         msg.data = text
         self.speak_pub.publish(msg)
         self.get_logger().info(f'Said: "{text}"')
+
+    def spin_180(self):
+        """Obrni robota za 180 stopinj (pi radianov) in počakaj, da konča."""
+        self.get_logger().info("Spinning 180 degrees before moving to the next point...")
+        self.rc.spin(spin_dist=math.pi, time_allowance=10)
+
+        while not self.rc.isTaskComplete():
+            time.sleep(0.5)
+
+        self.get_logger().info("180 degree spin completed.")
 
     
     def publish_location_marker(self, pose: PoseStamped):
