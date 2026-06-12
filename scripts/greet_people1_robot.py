@@ -106,6 +106,9 @@ class greet_people(Node):
 
     def greet(self):
         # Use the first N PoseStamped messages as exact goals
+        self.speak(f"I have detected {self.n} people, I will begin greeting.")
+        time.sleep(4)
+
         for pose_msg in self.queue[:self.n_persons]:
             self.greet_person(pose_msg)
 
