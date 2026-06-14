@@ -32,6 +32,10 @@ from visualization_msgs.msg import Marker
 from recognize_people_2s import PeopleRecognizer
 from robot_commander import RobotCommander
 
+# za sinhronizacijo
+import message_filters
+
+
 MODEL_PATH = "yolo26n-face.pt"
 
 
@@ -87,7 +91,7 @@ class detect_faces(Node):
 		# {"x": float, "y": float, "done": bool, "n": int, "sum_x": float, "sum_y": float, "marker_published": bool}
 		self.tracks = []
 
-		# Notify other nodes (e.g., QR scanning) when we have arrived at a person
+		# Notify other nodes (task manager) when we have arrived at a person
 		self.current_person_pub = self.create_publisher(String, "/current_person", 10)
 		# Signals when we're actively approaching/handling a person (nav + recognition)
 		self.approach_active_pub = self.create_publisher(Bool, "/approach_active", 10)
@@ -111,11 +115,20 @@ class detect_faces(Node):
 			self.get_logger().error(f"Could not load recognizer DB: {e}")
 
 		# subscribe to image + pointcloud
-		self.rgb_image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.rgb_callback, qos_profile_sensor_data)
-		self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
+		self.rgb_sub = message_filters.Subscriber(self, Image, "/oakd/rgb/preview/image_raw")
+		self.pc_sub = message_filters.Subscriber(self, PointCloud2, "/oakd/rgb/preview/depth/points")
+		# Temporal synchronizer with 0.05s slop tolerance and queue size of 10
+		self.ts = message_filters.ApproximateTimeSynchronizer(
+			[self.rgb_sub, self.pc_sub],
+			queue_size=10,
+			slop=0.05
+		)
+		self.ts.registerCallback(self.synced_callback)
+
 
 		model_path = os.path.join(self.package_share_dir, MODEL_PATH)
 		self.model = YOLO(model_path)
+
 
 	def _expand_bbox_for_draw(self, bbox, image_shape):
 		x1, y1, x2, y2 = bbox
@@ -133,6 +146,7 @@ class detect_faces(Node):
 		if nx2 <= nx1 or ny2 <= ny1:
 			return (int(x1), int(y1), int(x2), int(y2))
 		return (int(nx1), int(ny1), int(nx2), int(ny2))
+
 
 	def _publish_person_marker(self, person_id: int, x: float, y: float, z: float = 0.0) -> None:
 		msg = Marker()
@@ -159,6 +173,7 @@ class detect_faces(Node):
 
 		self.marker_pub.publish(msg)
 
+	# preveri ali je znotraj merge radius starih zaznav
 	def _is_visited(self, x_map: float, y_map: float) -> bool:
 		r2 = float(self.merge_radius_m) * float(self.merge_radius_m)
 		for (vx, vy) in self.visited:
@@ -175,129 +190,120 @@ class detect_faces(Node):
 		self.visited.append((float(x_map), float(y_map)))
 
 
-	# detects faces
-	def rgb_callback(self, data):
+	# zagotovimo da je rgb image na enakem time stamp kot point claud
+	def synced_callback(self, rgb_msg, pc_msg):
+		# Najprej poženi YOLO na RGB sliki
 		self.faces = []
-
 		try:
-			cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+			cv_image = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
 			self.latest_image = cv_image
+		except CvBridgeError as e:
+			self.get_logger().error(f"CvBridge error: {e}")
+			return
 
-			# run inference
-			res = self.model.predict(cv_image, imgsz=(256, 320), show=False, verbose=False, device=self.device)
+		# run inference with YOLO
+		res = self.model.predict(cv_image, imgsz=(256, 320), show=False, verbose=False, device=self.device)
+		if (not res): return
 
-			# iterate over results
-			for result in res:
-				if result.boxes is None or len(result.boxes) == 0:
+		# iterate over results
+		for result in res:
+			if result.boxes is None or len(result.boxes) == 0:
+				continue
+			for box in result.boxes:
+				bbox = box.xyxy[0]
+				if float(box.conf) < self.face_t:
 					continue
+				x1 = int(bbox[0]); y1 = int(bbox[1]); x2 = int(bbox[2]); y2 = int(bbox[3])
+				cx = int((x1 + x2) / 2)
+				cy = int((y1 + y2) / 2)
+				face_bbox = (x1, y1, x2, y2)
+				draw_bbox = self._expand_bbox_for_draw(face_bbox, cv_image.shape)
+				cv_image = cv2.rectangle(cv_image, (draw_bbox[0], draw_bbox[1]), (draw_bbox[2], draw_bbox[3]), self.detection_color, 3)
+				# draw the center of bounding box
+				cv_image = cv2.circle(cv_image, (cx, cy), 5, self.detection_color, -1)
+				self.faces.append({"cx": cx, "cy": cy, "bbox": face_bbox, "draw_bbox": draw_bbox})
 
-				for box in result.boxes:
-					bbox = box.xyxy[0]
+		"""
+		# Če je self.live_recognition == True, se naredi recognnition
+		# (ko ...)
+		if self.live_recognition and self.recognizer is not None and self.faces:
+			now = time.monotonic()
+			# preveri da je dovolj časa minilo od zadnjega recognition
+			if (now - float(self._last_live_recog_t)) >= float(self._live_recog_period_s):
+				self._last_live_recog_t = now
+				face = max(self.faces, key=lambda f: (f["bbox"][2] - f["bbox"][0]) * (f["bbox"][3] - f["bbox"][1]))
+				crop = self._crop_bbox(self.latest_image, face["bbox"])
+				label = None
+				if crop is not None:
+					# naredi person recognition
+					try:
+						result = self.recognizer.recognize(crop)
+					except Exception:
+						result = None
+					if result is not None and result.get("name"):
+						label = (result.get("name"), result.get("gender"))
+				self._live_label = label
+		"""
 
-					x = float(box.conf)
-					if x < self.face_t:
-						continue
-
-					#self.get_logger().info("Person has been detected!")
-
-					x1 = int(bbox[0]); y1 = int(bbox[1]); x2 = int(bbox[2]); y2 = int(bbox[3])
-					face_bbox = (x1, y1, x2, y2)
-					draw_bbox = self._expand_bbox_for_draw(face_bbox, cv_image.shape)
-
-					# draw expanded rectangle (frames the whole portrait/picture)
-					cv_image = cv2.rectangle(
-						cv_image,
-						(int(draw_bbox[0]), int(draw_bbox[1])),
-						(int(draw_bbox[2]), int(draw_bbox[3])),
-						self.detection_color,
-						3,
-					)
-
-					cx = int((bbox[0] + bbox[2]) / 2)
-					cy = int((bbox[1] + bbox[3]) / 2)
-
-					# draw the center of bounding box
-					cv_image = cv2.circle(cv_image, (cx, cy), 5, self.detection_color, -1)
-
-					self.faces.append({"cx": cx, "cy": cy, "bbox": face_bbox, "draw_bbox": draw_bbox})
-
-			# Optional: run lightweight live recognition (label overlay), throttled.
-			if self.live_recognition and self.recognizer is not None and self.faces:
-				now = time.monotonic()
-				if (now - float(self._last_live_recog_t)) >= float(self._live_recog_period_s):
-					self._last_live_recog_t = now
+		# ko pride robot do osebe (če self._recognizing_track == true, stoji robot pred osebo)
+		# If we're at a person, try recognition on every RGB frame (no extra waiting)
+		if self._recognizing_track is not None and self.recognizer is not None and self.faces:
+			track_ix = int(self._recognizing_track)
+			# je veljavna in še ni bila prepoznana
+			if 0 <= track_ix < len(self.tracks) and not self.tracks[track_ix].get("done"):
+				if (time.monotonic() - float(self._recognition_started_t)) <= float(self._recognition_timeout_s):
 					face = max(self.faces, key=lambda f: (f["bbox"][2] - f["bbox"][0]) * (f["bbox"][3] - f["bbox"][1]))
 					crop = self._crop_bbox(self.latest_image, face["bbox"])
-					label = None
 					if crop is not None:
-						try:
-							result = self.recognizer.recognize(crop)
-						except Exception:
-							result = None
+						# run recognition
+						result = self.recognizer.recognize(crop)
 						if result is not None and result.get("name"):
-							label = (result.get("name"), result.get("gender"))
-					self._live_label = label
+							name = result.get("name")
+							gender = result.get("gender")
+							self._live_label = (name, gender)
+							self.tracks[track_ix]["done"] = True
+							self._remember_visited(float(self.tracks[track_ix].get("x", 0.0)), float(self.tracks[track_ix].get("y", 0.0)))
+							msg = String()
+							msg.data = json.dumps({"person": name, "gender": gender})
+							self.current_person_pub.publish(msg)
+							self.get_logger().info(f"Recognition done. person={name} gender={gender}. Published /current_person.")
+							self._recognizing_track = None
+							self.approach_active_pub.publish(Bool(data=False))
+				else:
+					self.get_logger().warn("Recognition timeout (no match).")
+					self.tracks[track_ix]["done"] = True
+					self._remember_visited(float(self.tracks[track_ix].get("x", 0.0)), float(self.tracks[track_ix].get("y", 0.0)))
+					self._recognizing_track = None
+					self.approach_active_pub.publish(Bool(data=False))
 
-			# Draw label above each bbox (if available)
-			if self._live_label is not None:
-				name, gender = self._live_label
-				label_text = f"{name} ({gender})" if gender else f"{name}"
-				for f in self.faces:
-					draw_bbox = f.get("draw_bbox") or f.get("bbox")
-					x1, y1, x2, y2 = [int(v) for v in draw_bbox]
-					tx = x1
-					ty = max(0, y1 - 10)
-					cv2.putText(
-						cv_image,
-						label_text,
-						(tx, ty),
-						cv2.FONT_HERSHEY_SIMPLEX,
-						0.7,
-						self.detection_color,
-						2,
-						cv2.LINE_AA,
-					)
-
-			# If we're at a person, try recognition on every RGB frame (no extra waiting)
-			if self._recognizing_track is not None and self.recognizer is not None and self.faces:
-				track_ix = int(self._recognizing_track)
-				if 0 <= track_ix < len(self.tracks) and not self.tracks[track_ix].get("done"):
-					if (time.monotonic() - float(self._recognition_started_t)) <= float(self._recognition_timeout_s):
-						face = max(self.faces, key=lambda f: (f["bbox"][2] - f["bbox"][0]) * (f["bbox"][3] - f["bbox"][1]))
-						crop = self._crop_bbox(self.latest_image, face["bbox"])
-						if crop is not None:
-							result = self.recognizer.recognize(crop)
-							if result is not None and result.get("name"):
-								name = result.get("name")
-								gender = result.get("gender")
-								self._live_label = (name, gender)
-								self.tracks[track_ix]["done"] = True
-								self._remember_visited(float(self.tracks[track_ix].get("x", 0.0)), float(self.tracks[track_ix].get("y", 0.0)))
-								msg = String()
-								msg.data = json.dumps({"person": name, "gender": gender})
-								self.current_person_pub.publish(msg)
-								self.get_logger().info(f"Recognition done. person={name} gender={gender}. Published /current_person.")
-								self._recognizing_track = None
-								self.approach_active_pub.publish(Bool(data=False))
-					else:
-						self.get_logger().warn("Recognition timeout (no match).")
-						self.tracks[track_ix]["done"] = True
-						self._remember_visited(float(self.tracks[track_ix].get("x", 0.0)), float(self.tracks[track_ix].get("y", 0.0)))
-						self._recognizing_track = None
-						self.approach_active_pub.publish(Bool(data=False))
-				
-			cv2.imshow("image", cv_image)
-			key = cv2.waitKey(1)
-			if key==27:
-				self.get_logger().info("Exiting (ESC pressed)")
-				rclpy.shutdown()
-				return
-
+		# Draw label above each bbox (if available)
+		if self._live_label is not None:
+			name, gender = self._live_label
+			label_text = f"{name} ({gender})" if gender else f"{name}"
+			for f in self.faces:
+				draw_bbox = f.get("draw_bbox") or f.get("bbox")
+				x1, y1, x2, y2 = [int(v) for v in draw_bbox]
+				tx = x1
+				ty = max(0, y1 - 10)
+				cv2.putText(
+					cv_image,
+					label_text,
+					(tx, ty),
+					cv2.FONT_HERSHEY_SIMPLEX,
+					0.7,
+					self.detection_color,
+					2,
+					cv2.LINE_AA,
+				)
 			
-		except CvBridgeError as e:
-			print(e)
+		cv2.imshow("image", cv_image)
+		cv2.waitKey(1)
 
+		# Takoj pokliči pointcloud logiko z guaranteed istim timestampom
+		self.pointcloud_callback(pc_msg)
 
+	# vsaki detekciji določi track_ix, ki jih nato po vrsti obiskuje
+	# QUEUE ZA OBISKOVANJE
 	def _find_track_ix(self, x_map: float, y_map: float):
 		for i, t in enumerate(self.tracks):
 			dx = float(t["x"]) - float(x_map)
@@ -306,6 +312,7 @@ class detect_faces(Node):
 				return i
 		return None
 
+	# za vsak track hrani koordinate, da jih lahko potem povpreči
 	def _add_location_sample(self, track_ix: int, x_map: float, y_map: float):
 		t = self.tracks[int(track_ix)]
 		# Keep a running average for stability
@@ -380,14 +387,14 @@ class detect_faces(Node):
 		ps.point.x = float(centroid[0])
 		ps.point.y = float(centroid[1])
 		ps.point.z = float(centroid[2])
+		
 		# transform point to map
 		try:
 			transform = self.tf_buffer.lookup_transform('map', 'base_link', ps.header.stamp)
 		except TransformException:
-			try:
-				transform = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
-			except TransformException:
-				return None
+			return None
+			
+
 		point_map = do_transform_point(ps, transform)
 		# rotate normal into map frame
 		nx, ny, nz = self._rotate_vector_by_quaternion(normal.tolist(), transform.transform.rotation)
@@ -519,6 +526,7 @@ class detect_faces(Node):
 		self.approach_active_pub.publish(Bool(data=True))
 		self.rc.goToPose(self._pending_goal)
 
+
 	def pointcloud_callback(self, data):
 		if self.latest_image is None or self.recognizer is None:
 			return
@@ -544,10 +552,7 @@ class detect_faces(Node):
 		try:
 			transform = self.tf_buffer.lookup_transform("map", "base_link", data.header.stamp)
 		except TransformException:
-			try:
-				transform = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
-			except TransformException:
-				return
+			return
 
 		# iterate over face coordinates
 		for face in self.faces:
@@ -604,10 +609,12 @@ class detect_faces(Node):
 					self._remember_visited(float(self.tracks[track_ix].get("x", 0.0)), float(self.tracks[track_ix].get("y", 0.0)))
 					continue
 			else:
+				# prva meritev: dodaj sample
 				self.tracks.append({"x": x1, "y": y1, "done": False, "n": 0, "sum_x": 0.0, "sum_y": 0.0, "marker_published": False, "img_cx": int(face["cx"]), "img_cy": int(face["cy"]), "pc_stamp": data.header.stamp})
 				track_ix = len(self.tracks) - 1
 				self._add_location_sample(track_ix, x1, y1)
 
+			# ko ima obraz dovolj detekcij, obiščemo lokacijo
 			# if this track isn't done yet, make sure we go to it (but never spam the same goal)
 			if not self.tracks[track_ix].get("done"):
 				if int(self.tracks[track_ix].get("n", 0)) >= int(self.min_location_samples):
