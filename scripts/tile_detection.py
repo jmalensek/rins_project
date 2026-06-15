@@ -21,6 +21,12 @@ cell detection, kjer poišče en konec linije, pa se počasi premika do drugega 
 najprej gre na desni konec, kamero pa ma gor na desno stran
 
 ko dobi task - preko topica dobi kateri cell mora obiskat
+
+
+potem je tukaj še vprašanje detekcije pravilnega cella - pasiven node, ki si shrani koordinate za rdeč in zelen cell
+
+na task managerju se sproži cell detectiong, pa dobi ta task, in se vžge
+
 '''
 
 
@@ -37,6 +43,9 @@ from pathlib import Path
 import json
 from datetime import datetime
 import subprocess
+import torch
+
+from anomaly_detector import AnomalyDetector
 
 
 class detect_tiles(Node):
@@ -47,7 +56,7 @@ class detect_tiles(Node):
             namespace='',
             parameters=[
                 ('device', ''),
-                ('model_path', ''),
+                ('model_path', 'best_model.pth'), # TREBA ACTUALLY PREVERIT KJE JE LOCIRAN
                 ('tile_size', 512),
                 ('confidence_threshold', 0.5),
         ])
@@ -62,7 +71,7 @@ class detect_tiles(Node):
 
         self.bridge = CvBridge()
         self.scan = None
-        self.load_model()
+        self.detector = self.load_model()
 
         self.image_sub = self.create_subscription(Image, "/top_camera/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
 
@@ -82,8 +91,12 @@ class detect_tiles(Node):
             print(f"spd-say not found. Would say: {text}")
 
     def load_model(self):
-        model = None
-        return model
+        detector = AnomalyDetector(
+            model_path=self.model_path,
+            threshold=self.confidence_threshold,
+            device=self.device if self.device else None
+        )
+        return detector
 
     def print_detected_tiles(self):
         print(f"Total tiles: {self.tiles['total']}")
@@ -137,9 +150,19 @@ class detect_tiles(Node):
         return warped
     
     def predict_anomaly(self, tile_image):
-        # Placeholder until the anomaly model is wired in.
-        # Return a valid tuple so the rest of the pipeline can continue.
-        return False, 0.0
+        # Convert BGR to RGB for the detector
+        rgb_image = cv2.cvtColor(tile_image, cv2.COLOR_BGR2RGB)
+        
+        # Get probability map from detector
+        prob_map = self.detector._predict(rgb_image)
+        
+        # Get max probability as confidence
+        confidence = float(prob_map.max())
+        
+        # Determine if anomaly based on threshold
+        is_anomaly = confidence > self.confidence_threshold
+        
+        return is_anomaly, confidence
 
     def get_tile_center(self, contour):
         """Calculate the center point of a tile contour"""
