@@ -43,7 +43,6 @@ from pathlib import Path
 import json
 from datetime import datetime
 import subprocess
-import torch
 
 from anomaly_detector import AnomalyDetector
 
@@ -91,6 +90,7 @@ class detect_tiles(Node):
             print(f"spd-say not found. Would say: {text}")
 
     def load_model(self):
+        # Use the existing AnomalyDetector class to load the model and handle preprocessing.
         detector = AnomalyDetector(
             model_path=self.model_path,
             threshold=self.confidence_threshold,
@@ -149,19 +149,10 @@ class detect_tiles(Node):
         warped = cv2.warpPerspective(image, H, (tile_size, tile_size))
         return warped
     
-    def predict_anomaly(self, tile_image):
-        # Convert BGR to RGB for the detector
-        rgb_image = cv2.cvtColor(tile_image, cv2.COLOR_BGR2RGB)
-        
-        # Get probability map from detector
-        prob_map = self.detector._predict(rgb_image)
-        
-        # Get max probability as confidence
-        confidence = float(prob_map.max())
-        
-        # Determine if anomaly based on threshold
-        is_anomaly = confidence > self.confidence_threshold
-        
+    def predict_anomaly(self, tile_image, save_path=None):
+        # Use the detector's public prediction method, optionally saving a report.
+        is_anomaly = self.detector.detect(tile_image, save_path=save_path)
+        confidence = 1.0 if is_anomaly else 0.0
         return is_anomaly, confidence
 
     def get_tile_center(self, contour):
@@ -221,13 +212,13 @@ class detect_tiles(Node):
                 cv2.imshow(f"Warped Tile {idx}", warped_tile)
                 cv2.waitKey(1)
 
-                is_anomaly, confidence = self.predict_anomaly(warped_tile)
+                report_path = f"reports/tile_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{idx}.png"
+                is_anomaly, confidence = self.predict_anomaly(warped_tile, save_path=report_path)
 
                 self.tiles['total'] += 1
                 if is_anomaly:
                     self.tiles['anomalous'] += 1
                     self.say("Anomaly detected")
-
                 else:
                     self.tiles['normal'] += 1
             except Exception as e:
