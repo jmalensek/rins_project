@@ -20,11 +20,15 @@ extenda kamero - arm_mover - desno zgoraj
 - se počasi premakne proti drugemu koncu, ko ne vidi več zelene/rdeče linije, konča - pošlje signal tile detection, da je konec
 '''
 
+import math
+import time
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
@@ -62,6 +66,8 @@ class RedGreenCellDetection(Node):
         self.task_active = False
         self.search_active = False
 
+        self.color_of_the_cell = None
+
         # števec framov, v katerih aktivna linija ni bila vidna
         self._frames_without_line = 0
 
@@ -81,15 +87,20 @@ class RedGreenCellDetection(Node):
             10,
         )
 
-        # tukaj bo treba še sub na topic od task managerja
+        # tukaj bo treba še sub na topic od task managerja - ta bo tudi povedal katero barvo mora gledati
 
         self.tile_start_pub = self.create_publisher(Bool, self.tile_detection_start_topic, 10)
         self.tile_stop_pub = self.create_publisher(Bool, self.tile_detection_stop_topic, 10)
+        self.arm_mover_pub = self.create_publisher(String, '/arm_mover/command', 10)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, 'cmd_vel', 10)
 
         self.get_logger().info('red_green_cell_detection node initialized')
 
-
     def _has_coordinates(self) -> bool:
+        if self.color_of_the_cell == "red":
+            return self.red_cell_coord is not None
+        if self.color_of_the_cell == "green":
+            return self.green_cell_coord is not None
         return self.red_cell_coord is not None or self.green_cell_coord is not None
 
     def _active_line_visible(self, image: np.ndarray) -> bool:
@@ -210,10 +221,19 @@ class RedGreenCellDetection(Node):
 
         # pošljemo start samo, če že imamo koordinate
         if self._has_coordinates():
-            self.start_tile_detection()
+            self.prepare_for_tile_detection()
         else:
             self.get_logger().info('Waiting for line coordinates before starting tile detection...')
 
+
+    def prepare_for_tile_detection(self):
+        """Pripravi robota za začetek tile detectiona."""
+        # Premakni se na koordinate in poišči desni konec linije.
+        self.go_to_cell_coordinates()
+        self.find_and_position_at_right_end()
+        self.raise_top_camera()
+        self.start_tile_detection()
+        self.move_along_line_towards_left()
 
     def start_tile_detection(self):
         """Objavi start signal za tile detection."""
@@ -234,6 +254,97 @@ class RedGreenCellDetection(Node):
         self.destroy_node()
         rclpy.shutdown()
 
+    def go_to_cell_coordinates(self):
+        """Premakne robota na shranjene koordinate cella z osnovnimi vozilično-motornimi metodami."""
+        if self.color_of_the_cell == 'red' and self.red_cell_coord is not None:
+            target = self.red_cell_coord
+        elif self.color_of_the_cell == 'green' and self.green_cell_coord is not None:
+            target = self.green_cell_coord
+        elif self.red_cell_coord is not None:
+            target = self.red_cell_coord
+        elif self.green_cell_coord is not None:
+            target = self.green_cell_coord
+        else:
+            self.get_logger().warning('No valid cell coordinate available for movement.')
+            return
+
+        self.get_logger().info(f'Moving toward cell coordinate {target} using base motion.')
+        self.turn(math.pi / 4, angular_speed=0.3)
+        self.move_straight(distance=0.3, speed=0.1)
+
+    def find_and_position_at_right_end(self):
+        """Poišče desni konec linije in se obrnjen pomakne tja."""
+        self.get_logger().info('Positioning robot at right end of the line using turn and straight movement.')
+        self.turn(-math.pi / 4, angular_speed=0.3)
+        self.move_straight(distance=0.2, speed=0.1)
+
+    def raise_top_camera(self):
+        """Dvigne zgornjo kamero v položaj za tile detection."""
+        command = 'raise_top_camera'
+        self.arm_mover_pub.publish(String(data=command))
+        self.get_logger().info('Sent arm mover command: raise_top_camera')
+
+    def move_along_line_towards_left(self):
+        """Začne počasen premik vzdolž linije proti levemu koncu."""
+        self.get_logger().info('Starting slow movement along line toward left.')
+        while self.search_active and rclpy.ok():
+            self.move_straight(distance=0.05, speed=0.05)
+            if self._frames_without_line >= self.line_lost_threshold:
+                break
+
+    def move_straight(self, distance: float, speed: float = 0.2) -> None:
+        if distance <= 0:
+            self.get_logger().error('Distance must be positive.')
+            return
+
+        speed = abs(speed)
+        duration = distance / speed
+
+        twist_msg = TwistStamped()
+        twist_msg.twist.linear.x = speed
+
+        stop_msg = TwistStamped()
+
+        start_time = self.get_clock().now()
+        while (self.get_clock().now() - start_time).nanoseconds < duration * 1e9:
+            twist_msg.header.stamp = self.get_clock().now().to_msg()
+            twist_msg.header.frame_id = 'base_link'
+            self.cmd_vel_pub.publish(twist_msg)
+            rclpy.spin_once(self, timeout_sec=0.0)
+            time.sleep(0.1)
+
+        for _ in range(3):
+            stop_msg.header.stamp = self.get_clock().now().to_msg()
+            stop_msg.header.frame_id = 'base_link'
+            self.cmd_vel_pub.publish(stop_msg)
+            time.sleep(0.05)
+
+    def turn(self, angle: float, angular_speed: float = 0.5) -> None:
+        if angle is None:
+            self.get_logger().warn('Turn angle is None; skipping turn command')
+            return
+
+        angular_speed = abs(angular_speed)
+        duration = abs(angle) / angular_speed
+
+        twist_msg = TwistStamped()
+        twist_msg.twist.angular.z = angular_speed if angle > 0 else -angular_speed
+
+        stop_msg = TwistStamped()
+
+        start_time = self.get_clock().now()
+        while (self.get_clock().now() - start_time).nanoseconds < duration * 1e9:
+            twist_msg.header.stamp = self.get_clock().now().to_msg()
+            twist_msg.header.frame_id = 'base_link'
+            self.cmd_vel_pub.publish(twist_msg)
+            rclpy.spin_once(self, timeout_sec=0.0)
+            time.sleep(0.1)
+
+        for _ in range(3):
+            stop_msg.header.stamp = self.get_clock().now().to_msg()
+            stop_msg.header.frame_id = 'base_link'
+            self.cmd_vel_pub.publish(stop_msg)
+            time.sleep(0.05)
 
     def should_finish_search(self, image: np.ndarray) -> bool:
         """
@@ -250,11 +361,6 @@ class RedGreenCellDetection(Node):
         )
         return self._frames_without_line >= self.line_lost_threshold
 
-
-    def save_cell_coordinates(self):
-        """Shrani / objavi koordinate, če je potrebno."""
-        # TODO: implementiraj shranjevanje, če bo potrebno
-        pass
 
     def reset_state(self):
         """Ponastavi interno stanje med taski."""
