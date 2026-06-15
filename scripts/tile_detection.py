@@ -35,6 +35,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
 
 from sensor_msgs.msg import Image, PointCloud2
+from std_msgs.msg import Bool
 
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
@@ -58,21 +59,30 @@ class detect_tiles(Node):
                 ('model_path', 'best_model.pth'), # TREBA ACTUALLY PREVERIT KJE JE LOCIRAN
                 ('tile_size', 512),
                 ('confidence_threshold', 0.5),
+                ('tile_detection_start_topic', '/tile_detection/start'),
+                ('tile_detection_stop_topic', '/tile_detection/stop'),
         ])
 
         self.device = self.get_parameter('device').get_parameter_value().string_value
         self.model_path = self.get_parameter('model_path').get_parameter_value().string_value
         self.tile_size = self.get_parameter('tile_size').get_parameter_value().integer_value
         self.confidence_threshold = self.get_parameter('confidence_threshold').get_parameter_value().double_value
+        self.tile_detection_start_topic = self.get_parameter('tile_detection_start_topic').get_parameter_value().string_value
+        self.tile_detection_stop_topic = self.get_parameter('tile_detection_stop_topic').get_parameter_value().string_value
 
         self.last_processed_tile_center = None
         self.tile_center_threshold = 50  # pixels
+        self.detection_active = False  # Flag to control when tile detection is active
 
         self.bridge = CvBridge()
         self.scan = None
         self.detector = self.load_model()
 
         self.image_sub = self.create_subscription(Image, "/top_camera/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
+        
+        # Subscribe to tile detection start/stop signals
+        self.tile_start_sub = self.create_subscription(Bool, self.tile_detection_start_topic, self.on_tile_detection_start, 10)
+        self.tile_stop_sub = self.create_subscription(Bool, self.tile_detection_stop_topic, self.on_tile_detection_stop, 10)
 
         self.tiles = {
                 'total': 0,
@@ -97,6 +107,22 @@ class detect_tiles(Node):
             device=self.device if self.device else None
         )
         return detector
+
+    def on_tile_detection_start(self, msg: Bool):
+        """Callback when tile detection start signal is received."""
+        if msg.data:
+            self.detection_active = True
+            self.get_logger().info("Tile detection activated")
+
+    def on_tile_detection_stop(self, msg: Bool):
+        """Callback when tile detection stop signal is received."""
+        if msg.data:
+            self.detection_active = False
+            self.get_logger().info("Tile detection deactivated")
+            self.get_logger().info("Shutting down tile detection node...")
+            self.print_detected_tiles()
+            self.destroy_node()
+            rclpy.shutdown()
 
     def print_detected_tiles(self):
         print(f"Total tiles: {self.tiles['total']}")
@@ -178,6 +204,10 @@ class detect_tiles(Node):
         
         cv2.imshow("Top Camera View", cv_image)
         cv2.waitKey(1)
+        
+        # Only process tiles if detection is active
+        if not self.detection_active:
+            return
         
         tiles_contours = self.detect_tiles(cv_image)
 
