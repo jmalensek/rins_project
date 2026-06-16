@@ -58,6 +58,7 @@ class RobotExplorer(Node):
         self._amcl_window = deque()
         self.localisation_streak = 0
         self.yellow_detected = False
+        self.actively_approaching = False
 
         self._last_bgr = None
 
@@ -96,6 +97,9 @@ class RobotExplorer(Node):
         # Subscription for yellow line detection
         self.create_subscription(Bool, '/yellow_line/detected', self._yellow_line_callback, 10)
 
+        # Something something, approaching a person
+        self.create_subscription(Bool, '/approach_active', self._approach_callback, 10)
+
         # za govor
         self.speak_pub = self.create_publisher(String, "/speak", 10)
 
@@ -107,6 +111,50 @@ class RobotExplorer(Node):
     # BASIC MOTORIC METHODS
 
     # Moves the robot straight for a given distance at a given speed
+    def move_straight(self, distance: float, speed: float = 0.2, tolerance: float = 0.02) ->None:
+        if distance <= 0:
+            self.get_logger().error("Distance must be positive.")
+            return
+        
+        start_position = self.get_current_position()
+        if start_position is None:
+            self.get_logger().warn("Current position is None; cannot perform move_straight")
+            return
+        
+        speed = abs(speed)
+
+        twist_msg = TwistStamped()
+        twist_msg.twist.linear.x = speed
+
+        stop_msg = TwistStamped()
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.0)
+
+            current_position = self.get_current_position()
+            if current_position is None:
+                self.get_logger().warn("Current position is None; cannot perform move_straight")
+                break
+            
+            travelled_distance = self.compute_distance(start_position, current_position)
+            if travelled_distance >= distance - tolerance:
+                break
+
+            twist_msg.header.stamp = self.get_clock().now().to_msg()
+            twist_msg.header.frame_id = "base_link"
+
+            self.cmd_vel_pub.publish(twist_msg)
+
+            time.sleep(0.05)
+
+        for _ in range(3):
+            stop_msg.header.stamp = self.get_clock().now().to_msg()
+            stop_msg.header.frame_id = "base_link"
+            self.cmd_vel_pub.publish(stop_msg)
+            time.sleep(0.05)
+
+    """
+    # Old move straight method using a time-based approach
     def move_straight(self, distance: float, speed: float = 0.2) -> None:
         if distance <= 0:
             self.get_logger().error("Distance must be positive.")
@@ -134,8 +182,51 @@ class RobotExplorer(Node):
             stop_msg.header.frame_id = 'base_link'
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
+    """
 
     # Turns the robot in place by a given angle (in radians) at a given angular speed
+    def turn(self, angle:float, angular_speed:float = 0.5) -> None:
+        if angle is None:
+            self.get_logger().warn("Turn angle is None; skipping turn command")
+            return
+        
+        start_yaw = self.get_current_yaw()
+        if start_yaw is None:
+            self.get_logger().warn("Current yaw is None; cannot perform turn")
+            return
+        
+        twist_msg = TwistStamped()
+        twist_msg.twist.angular.z = (abs(angular_speed) if angle > 0 else -abs(angular_speed))
+
+        stop_msg = TwistStamped()
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.0)
+
+            current_yaw = self.get_current_yaw()
+            if current_yaw is None:
+                self.get_logger().warn("Current yaw is None; cannot perform turn")
+                break
+            
+            turned_angle = self.normalize_angle(current_yaw - start_yaw)
+            if abs(turned_angle) >= abs(angle):
+                break
+
+            twist_msg.header.stamp = self.get_clock().now().to_msg()
+            twist_msg.header.frame_id = "base_link"
+
+            self.cmd_vel_pub.publish(twist_msg)
+
+            time.sleep(0.05)
+
+        for _ in range(3):
+            stop_msg.header.stamp = self.get_clock().now().to_msg()
+            stop_msg.header.frame_id = "base_link"
+            self.cmd_vel_pub.publish(stop_msg)
+            time.sleep(0.05)
+
+    """
+    # Old turn method using a time-based approach
     def turn(self, angle: float, angular_speed: float = 0.5) -> None:
         if angle is None:
             self.get_logger().warn("Turn angle is None; skipping turn command")
@@ -165,6 +256,7 @@ class RobotExplorer(Node):
             stop_msg.header.frame_id = 'base_link'
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
+    """
 
     # Rotates the robot in place by dividing a full circle into equal turns, with a wait time in between
     def rotate(self, turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0) -> None:
@@ -267,6 +359,7 @@ class RobotExplorer(Node):
 
     # NAVIGATION METHODS
 
+    # Move through area1 while avoiding obstacles and the yellow line
     def explore_area1(self, speed: float = 0.2, angular_speed: float = 1.0, timeout_sec: float = 120.0) -> None:
         self.get_logger().info("Starting exploration of area 1...")
 
@@ -284,6 +377,8 @@ class RobotExplorer(Node):
     def cover_waypoints(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0, localise: bool = True) -> None:
         for index, (x, y) in enumerate(waypoints):
 
+            """
+            # Basic /finished signal interruption mechanism
             if self.finished_count > 0:
                 self.get_logger().info("Interrupt signal received, waiting...")
 
@@ -297,6 +392,14 @@ class RobotExplorer(Node):
 
                 self.get_logger().info("Resuming waypoint coverage...")
                 self.finished_count = 0
+            """
+
+            # Some new active approach interruption mechanism, that I don't fully understand
+            while self.actively_approaching:
+                self.get_logger().info("Active approach in progress, waiting...")
+
+                # Wait a short while before checking again
+                rclpy.spin_once(self, timeout_sec=0.1)
 
             # Compute the yaw angle to face at the next waypoint
             yaw = 0.0
@@ -515,6 +618,23 @@ class RobotExplorer(Node):
         target_x, target_y = target_pose
         return math.atan2(target_y, target_x)
     
+    # Get the yaw of the robot's current position
+    def get_current_yaw(self) -> float:
+        if self.amcl_pose_msg is None:
+            self.get_logger().warn("AMCL pose not received yet")
+            return None
+        
+        q = self.amcl_pose_msg.pose.pose.orientation
+        return self._quaternion_to_yaw(q)
+    
+    # Normalise an angle to the range [-pi, pi]
+    def normalize_angle(self, angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+        
     # Computes the distance between two poses
     def compute_distance(self, pose1: tuple[float, float], pose2: tuple[float, float]) -> float:
         x1, y1 = pose1
@@ -526,6 +646,16 @@ class RobotExplorer(Node):
     def compute_relative_distance(self, target_pose: tuple[float, float]) -> float:
         target_x, target_y = target_pose
         return math.sqrt(target_x ** 2 + target_y ** 2)
+
+    # Get the robot's current position
+    def get_current_position(self) -> tuple[float, float]:
+        if self.amcl_pose_msg is None:
+            self.get_logger().warn("AMCL pose not received yet")
+            return None
+        
+        x = self.amcl_pose_msg.pose.pose.position.x
+        y = self.amcl_pose_msg.pose.pose.position.y
+        return (x, y)
 
     # Checks whether amcl pose is stable an the robot is well-localised
     def is_localised(self, pos_threshold: float = 0.2, yaw_threshold: float = 0.2, min_streak: int = 3) -> bool:
@@ -747,6 +877,12 @@ class RobotExplorer(Node):
             self._last_bgr = img
         except Exception as e:
             self.get_logger().warn(f"Failed to convert image without cv_bridge: {e}")
+
+    def _approach_callback(self, msg: Bool) -> None:
+        try:
+            self.approach_active = bool(msg.data)
+        except Exception:
+            self.get_logger().warn('Received malformed /approach_active message')
 
     def speak(self, text):
         msg = String()
