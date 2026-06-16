@@ -93,10 +93,10 @@ class RobotExplorer(Node):
 
         # SUBSCRIBERS
         # Laser scan data for obstacle detection and navigation
-        self.create_subscription(LaserScan, 'scan_filtered', self._scan_callback, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, '/scan_filtered', self._scan_callback, qos_profile_sensor_data)
 
         # Occupancy grid map data for navigation and waypoint generation
-        self.create_subscription(OccupancyGrid, 'map', self._map_callback, map_qos)
+        self.create_subscription(OccupancyGrid, '/map', self._map_callback, map_qos)
 
         # Finished signal for interruption mechanisms
         self.create_subscription(Bool, '/finished', self._finished_callback, 10)
@@ -289,7 +289,7 @@ class RobotExplorer(Node):
     """
                 
      # Moves the robot straight ahead at a given speed until it either detects an obstacle or a yellow line
-    def move_in_area1(self, speed: float = 0.2, obst_range: float = 0.5, range_sample_n: int = 3, timeout_sec: float = 30.0) -> None:
+    def move_in_area1(self, speed: float = 0.2, obst_range: float = 0.1, range_sample_n: int = 3, timeout_sec: float = 30.0) -> None:
         speed = abs(speed)
 
         twist_msg = TwistStamped()
