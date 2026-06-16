@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """
 anomaly_detector.py — AnomalyDetector razred za uporabo v ROS2 node.
 
