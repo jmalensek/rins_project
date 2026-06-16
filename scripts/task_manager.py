@@ -43,7 +43,7 @@ except Exception:
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from std_srvs.srv import Trigger
 
 from reportlab.lib.pagesizes import A4
@@ -204,6 +204,13 @@ class TaskNode(Node):
         # /task_input = simulacija mikrofona; zamenjaj z STT ko bo na voljo
         self.create_subscription(String, "/task_input", self._task_input_cb, 10)
 
+        self.start_task_anomaly_pub = self.create_publisher(Bool, "/task_manager/task_started", 10)
+        self.color_of_the_cell_pub = self.create_publisher(String, "/task_manager/color_of_the_cell", 10)
+        
+        # DODANO ŠE DA SI SHRANI KATERA BARVA JE PRI ANOMALY DETECTION -
+        # treba še actually inplementirat katera barva, tu je samo placeholder
+        self.color_of_the_cell = None
+        
         self.create_service(Trigger, "/get_tasks", self._get_tasks_srv)
 
         self.get_logger().info("Task_manager starting.")
@@ -473,6 +480,20 @@ class TaskNode(Node):
         # Potrditev
         spoken_task = task if task in TASK_KEYWORDS else normalize_task(task)
         self.say(f"Understood. I will perform: {spoken_task}.")
+
+        if spoken_task == "Anomaly detection":
+            self.start_task_anomaly_pub.publish(Bool(data=True))
+
+
+        '''
+        TREBA DODAT DA BO ŠE PUBLISHAL BARVO
+        
+            if self.color_of_the_cell == 'green':
+                self.color_of_the_cell_pub.publish(String(data='green'))
+            elif self.color_of_the_cell == 'red':
+                self.color_of_the_cell_pub.publish(String(data='red'))
+        
+        '''
 
         if name.strip().lower() == "jeff":
             pdf_path = self._generate_tasks_pdf()
