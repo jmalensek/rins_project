@@ -38,6 +38,98 @@ link_directories(${PCL_LIBRARY_DIRS})
 
 set(dependencies rclcpp std_msgs std_srvs geometry_msgs sensor_msgs visualization_msgs tf2 tf2_geometry_msgs pcl_conversions message_filters cv_bridge)
 
+add_executable(cylinder_segmentation cplusplus/cylinder_segmentation.cpp)
+ament_target_dependencies(cylinder_segmentation ${dependencies})
+
+
+target_link_libraries(cylinder_segmentation
+  ${Boost_SYSTEM_LIBRARY}
+  ${PCL_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+)
+
+install(TARGETS
+  cylinder_segmentation
+  DESTINATION lib/${PROJECT_NAME}/
+)
+
+install(DIRECTORY
+  launch
+  config
+  embeddings_db
+  worlds
+  maps
+  urdf
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+install(FILES
+  yolo26n-face.pt
+  embeddings.json
+  best_model.pth
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+install(PROGRAMS
+  scripts/detect_people.py
+  scripts/DETECT_PEOPLE_2s.py
+  scripts/robot_commander.py
+  scripts/robot_explorer.py
+  scripts/detect_people2.py
+  scripts/detect_rings27.py
+  scripts/greet_people.py
+  scripts/greet_people_faster.py
+  scripts/cylinder_detection.py
+  scripts/recognize_people_2s.py
+  scripts/new_cylinder.py
+  scripts/detect_yellow_line.py
+  scripts/tile_detection.py
+  scripts/anomaly_detector.py
+  scripts/task_manager.py
+  scripts/red_green_cell_detection.py
+  DESTINATION lib/${PROJECT_NAME})
+
+ament_package()
+cmake_minimum_required(VERSION 3.5)
+project(rins_project)
+
+cmake_policy(SET CMP0144 NEW)
+cmake_policy(SET CMP0074 NEW)
+
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 14)
+endif()
+
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
+
+find_package(rclcpp REQUIRED)
+find_package(rclpy REQUIRED)
+
+find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(message_filters REQUIRED)
+find_package(cv_bridge REQUIRED)
+
+find_package(OpenCV REQUIRED)
+
+find_package(pcl_conversions REQUIRED)
+find_package(PCL 1.10 REQUIRED)
+
+include_directories(${PCL_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS} include)
+link_directories(${PCL_LIBRARY_DIRS})
+
+set(dependencies rclcpp std_msgs std_srvs geometry_msgs sensor_msgs visualization_msgs tf2 tf2_geometry_msgs pcl_conversions message_filters cv_bridge)
+
 install(DIRECTORY
   launch
   config
