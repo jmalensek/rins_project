@@ -916,7 +916,7 @@ class RobotExplorer(Node):
 
     def _approach_callback(self, msg: Bool) -> None:
         try:
-            self.approach_active = bool(msg.data)
+            self.actively_approaching = bool(msg.data)
         except Exception:
             self.get_logger().warn('Received malformed /approach_active message')
 
