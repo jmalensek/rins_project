@@ -4,6 +4,7 @@ import rclpy
 import time
 import math
 import tf2_ros
+import threading
 
 from collections import deque
 
@@ -30,6 +31,14 @@ from sensor_msgs.msg import Image
 
 from std_msgs.msg import String
 
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+
+amcl_qos = QoSProfile(
+    depth=10,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL
+)
+
 map_qos = QoSProfile(
     durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
     reliability=QoSReliabilityPolicy.RELIABLE,
@@ -41,6 +50,10 @@ class RobotExplorer(Node):
 
     def __init__(self, node_name='robot_explorer', namespace=''):
         super().__init__(node_name=node_name, namespace=namespace)
+
+        #self.set_parameters([
+        #    rclpy.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)
+        #    ])
         
         self.pose_frame_id = 'map'
         
@@ -57,7 +70,7 @@ class RobotExplorer(Node):
         self.amcl_pose_msg = None
         self._amcl_window = deque()
         self.localisation_streak = 0
-        self.yellow_detected = False
+        self.yellow_ahead = False
         self.actively_approaching = False
 
         self._last_bgr = None
@@ -89,13 +102,13 @@ class RobotExplorer(Node):
         self.create_subscription(Bool, '/finished', self._finished_callback, 10)
 
         # AMCL pose estimates for localisation and navigation feedback
-        self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._amcl_pose_callback, 10)
+        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self._amcl_pose_callback, amcl_qos)
 
         # Camera images for line following and visual processing
         self.create_subscription(Image, "/top_camera/rgb/preview/image_raw", self._image_callback, image_qos)
 
         # Subscription for yellow line detection
-        self.create_subscription(Bool, '/yellow_line/detected', self._yellow_line_callback, 10)
+        self.create_subscription(Bool, '/yellow_line/ahead', self._yellow_line_callback, 10)
 
         # Something something, approaching a person
         self.create_subscription(Bool, '/approach_active', self._approach_callback, 10)
@@ -111,7 +124,7 @@ class RobotExplorer(Node):
     # BASIC MOTORIC METHODS
 
     # Moves the robot straight for a given distance at a given speed
-    """
+    
     # AMCL-based move straight method; Unsable, because the amcl topic just doesn't work for some reason
     def move_straight(self, distance: float, speed: float = 0.2, tolerance: float = 0.02) ->None:
         if distance <= 0:
@@ -154,8 +167,8 @@ class RobotExplorer(Node):
             stop_msg.header.frame_id = "base_link"
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
+    
     """
-
     # Old move straight method using a time-based approach
     def move_straight(self, distance: float, speed: float = 0.2) -> None:
         if distance <= 0:
@@ -186,12 +199,17 @@ class RobotExplorer(Node):
             time.sleep(0.05)
 
     # Turns the robot in place by a given angle (in radians) at a given angular speed
-
     """
+
     # AMCL-based turn method; Unstable, because the amcl topic just doesn't work for some reason
     def turn(self, angle:float, angular_speed:float = 0.5) -> None:
         if angle is None:
             self.get_logger().warn("Turn angle is None; skipping turn command")
+            return
+        
+        # Only angles in the range [-pi, pi] are valid for turning
+        if angle > math.pi or angle < -math.pi:
+            self.get_logger().warn(f"Turn angle {angle:.2f} rad is out of range [-pi, pi]; skipping turn command")
             return
         
         start_yaw = self.get_current_yaw()
@@ -228,8 +246,8 @@ class RobotExplorer(Node):
             stop_msg.header.frame_id = "base_link"
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
-    """
 
+    """
     # Old turn method using a time-based approach
     def turn(self, angle: float, angular_speed: float = 0.5) -> None:
         if angle is None:
@@ -268,9 +286,10 @@ class RobotExplorer(Node):
             for _ in range(turns):
                 self.turn(angle, angular_speed)
                 time.sleep(wait_time)
-
+    """
+                
      # Moves the robot straight ahead at a given speed until it either detects an obstacle or a yellow line
-    def move_in_area1(self, speed: float = 0.2, obst_range: float = 0.5, range_sample_n: int = 10,timeout_sec: float = 30.0) -> None:
+    def move_in_area1(self, speed: float = 0.2, obst_range: float = 0.5, range_sample_n: int = 3, timeout_sec: float = 30.0) -> None:
         speed = abs(speed)
 
         twist_msg = TwistStamped()
@@ -283,8 +302,8 @@ class RobotExplorer(Node):
         start_time = self.get_clock().now()
         while (self.get_clock().now() - start_time).nanoseconds < timeout_sec * 1e9:
 
-            # If a yellow line is detected, stop
-            if self.yellow_detected:
+            # If a yellow line is detected ahead, stop
+            if self.yellow_ahead:
                 self.get_logger().info("Yellow line detected; stopping movement.")
                 break
             
@@ -747,6 +766,21 @@ class RobotExplorer(Node):
 
             rclpy.spin_once(self, timeout_sec=0.1)
 
+    # Waits for amcl pose data to be received, with a timeout
+    def wait_for_amcl_pose(self, timeout_sec: float = 5.0) -> bool:
+        start_time = self.get_clock().now()
+
+        while rclpy.ok():
+            if self.amcl_pose_msg is not None:
+                return True
+
+            elapsed = (self.get_clock().now() - start_time).nanoseconds / 1e9
+            if elapsed >= timeout_sec:
+                self.get_logger().warn(f"No AMCL pose received within {timeout_sec:.1f}s")
+                return False
+
+            rclpy.spin_once(self, timeout_sec=0.1)
+
     # Helper method to get the occupancy value of a cell in the map
     def _cell(self, mx: int, my: int) -> int:
         w = self.map_data.info.width
@@ -831,9 +865,9 @@ class RobotExplorer(Node):
     def _yellow_line_callback(self, msg: Bool) -> None:
         # store latest detection state
         try:
-            self.yellow_detected = bool(msg.data)
+            self.yellow_ahead = bool(msg.data)
         except Exception:
-            self.get_logger().warn('Received malformed /yellow_line/detected message')
+            self.get_logger().warn('Received malformed /yellow_line/ahead message')
 
     def _image_callback(self, msg: Image) -> None:
         try:
@@ -898,10 +932,25 @@ def main(args = None):
     rclpy.init(args=args)
     re = RobotExplorer()
 
+    executor = rclpy.executors.SingleThreadedExecutor()
+    executor.add_node(re)
+
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
+    # now your code can run normally
     time.sleep(3.0)
 
+    # Wait for map data
     if not re.wait_for_map_data(timeout_sec=10.0):
         re.get_logger().error('Map was not received, aborting.')
+        re.destroy_node()
+        rclpy.shutdown()
+        return
+
+    # Wait for amcl pose data
+    if not re.wait_for_amcl_pose(timeout_sec=10.0):
+        re.get_logger().error('AMCL pose was not received, aborting.')
         re.destroy_node()
         rclpy.shutdown()
         return
@@ -957,14 +1006,13 @@ def main(args = None):
                     (-2.9796109425001718, -1.0694166887545653),
                     (-3.26013179610062, -1.1159374308024788)]
 
-    while True:
-        continue
-
     #waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=1.5)
     #print(f"Generated {len(waypoints_task2_sim_area1)} waypoints for area 1")
 
-    #re.turn(2 * math.pi)
-    #re.move_in_area1(speed=0.2, timeout_sec=30.0)
+    #re.move_straight(distance=0.5, speed=0.2)
+
+    #re.turn(-math.pi/2)
+    re.move_in_area1(speed=0.2, timeout_sec=30.0)
     #re.turn(math.pi/2)
     #re.move_in_area1(speed=0.2, timeout_sec=30.0)
 
@@ -976,7 +1024,7 @@ def main(args = None):
     #re.follow_blue_line()
 
     # TASK 1R
-    re.cover_waypoints(waypoints_irl, wait_time=0.5, localise=True)
+    #re.cover_waypoints(waypoints_irl, wait_time=0.5, localise=True)
     
     re.get_logger().info("Exploration complete, shutting down.")
     re.destroy_node()
