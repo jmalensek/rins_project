@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
-# INSTALL: vosk, pyaudio, (sounddevice)
-# sudo apt install -y libportaudio2 portaudio19-dev
+# pip install vosk --break-system-packages
+# pip install sounddevice --break-system-packages
+# pip install reportlab --break-system-packages
+
+# V RINS PROJECT DOWNLOAD VOSK MODEL (https://alphacephei.com/vosk/models) v src/rins_project/vosk-model-en-us-0.22
 
 """
 task_node.py
@@ -33,9 +36,9 @@ import time
 import json as _json
 
 try:
-    import pyaudio  # type: ignore[import-not-found]
+    import sounddevice as sd  # type: ignore[import-not-found]
 except Exception:
-    pyaudio = None  # type: ignore[assignment]
+    sd = None  # type: ignore[assignment]
 
 try:
     from vosk import Model, KaldiRecognizer  # type: ignore[import-not-found]
@@ -179,7 +182,8 @@ class TaskNode(Node):
         super().__init__("task_node")
 
         # Optional offline STT configuration (Vosk)
-        self.model_path = "/home/lea/colcon_ws/vosk-model-en-us-0.22"
+        #self.model_path = "/home/lea/colcon_ws/vosk-model-en-us-0.22"
+        self.model_path = "./src/rins_project/vosk-model-en-us-0.22"
         self.declare_parameter("mic_device_index", -1)
 
         self._vosk_model = None
@@ -195,16 +199,16 @@ class TaskNode(Node):
 
         self._vosk_grammar = GRAMMAR
 
-        self._pa = None
+        self._sd = None
         self._mic_stream = None
         self._mic_lock = threading.Lock()
         self._mic_suppressed_until = 0.0
-        if pyaudio is not None:
+        if sd is not None:
             try:
-                self._pa = pyaudio.PyAudio()
+                self._sd = sd
             except Exception as exc:
-                self.get_logger().error(f"Failed to init PyAudio: {exc}")
-                self._pa = None
+                self.get_logger().error(f"Failed to initialize sounddevice: {exc}")
+                self._sd = None
 
         # Trenutna oseba
         self.current_person: str | None = None
@@ -238,7 +242,7 @@ class TaskNode(Node):
 
     def _get_mic_stream(self, sample_rate: int, chunk: int):
         """Get (or open) a persistent microphone input stream."""
-        if self._pa is None:
+        if self._sd is None:
             return None
 
         with self._mic_lock:
@@ -252,20 +256,49 @@ class TaskNode(Node):
 
             open_kwargs = {}
             if device_index >= 0:
-                open_kwargs["input_device_index"] = device_index
+                open_kwargs["device"] = device_index
 
             try:
-                self._mic_stream = self._pa.open(
-                    format=pyaudio.paInt16,
+                # Use RawInputStream so we get bytes similar to PyAudio's stream.read()
+                raw = self._sd.RawInputStream(
+                    samplerate=sample_rate,
+                    blocksize=chunk,
                     channels=1,
-                    rate=sample_rate,
-                    input=True,
-                    frames_per_buffer=chunk,
+                    dtype='int16',
                     **open_kwargs,
                 )
+
+                class SoundDeviceStream:
+                    def __init__(self, raw_stream):
+                        self._raw = raw_stream
+
+                    def start_stream(self):
+                        try:
+                            self._raw.start()
+                        except Exception:
+                            pass
+
+                    def read(self, frames, exception_on_overflow=False):
+                        # RawInputStream.read(frames) -> (data, overflowed)
+                        data, overflowed = self._raw.read(frames)
+                        return data
+
+                    def stop_stream(self):
+                        try:
+                            self._raw.stop()
+                        except Exception:
+                            pass
+
+                    def close(self):
+                        try:
+                            self._raw.close()
+                        except Exception:
+                            pass
+
+                self._mic_stream = SoundDeviceStream(raw)
                 return self._mic_stream
             except Exception as exc:
-                self.get_logger().error(f"Failed to open microphone input stream: {exc}")
+                self.get_logger().error(f"Failed to open microphone input stream (sounddevice): {exc}")
                 self._mic_stream = None
                 return None
 
