@@ -16,7 +16,7 @@ class ObstacleDetector(Node):
 
         # Parameters
         self.declare_parameter("scan_topic", "/scan")
-        self.declare_parameter("obstacle_distance_threshold", 1.0)  # meters
+        self.declare_parameter("obstacle_distance_threshold", 0.5)  # meters
 
         self.scan_topic = self.get_parameter("scan_topic").value
         self.threshold = self.get_parameter("obstacle_distance_threshold").value
@@ -46,8 +46,8 @@ class ObstacleDetector(Node):
         if len(ranges) == 0:
             return
 
-        # Take center window (front of robot)
-        mid = len(msg.ranges) // 2
+        # Take center window (front of robot), 1/4 of the scan range I guess
+        mid = len(msg.ranges) // 4
         window_size = 20  # adjust (10–50 typical)
 
         start = max(0, mid - window_size)
@@ -75,7 +75,7 @@ class ObstacleDetector(Node):
 
         # Optional logging (avoid spam)
         if obstacle_ahead:
-            self.get_logger().warn(f"Obstacle ahead! distance={min_dist:.2f} m")
+            self.get_logger().warn(f"Obstacle ahead; distance={min_dist:.2f} m")
 
 
 def main(args=None):
