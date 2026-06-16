@@ -23,6 +23,8 @@ extenda kamero - arm_mover - desno zgoraj
 import math
 import time
 
+from matplotlib import image
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -66,7 +68,6 @@ class RedGreenCellDetection(Node):
         self.task_active = False
         self.search_active = False
 
-        self.color_of_the_cell = None
 
         # števec framov, v katerih aktivna linija ni bila vidna
         self._frames_without_line = 0
@@ -80,6 +81,7 @@ class RedGreenCellDetection(Node):
             qos_profile_sensor_data,
         )
 
+        # sub na topic od task managerja - ta bo tudi povedal katero barvo mora gledati
         self.task_start_sub = self.create_subscription(
             Bool,
             self.task_start_topic,
@@ -87,14 +89,28 @@ class RedGreenCellDetection(Node):
             10,
         )
 
-        # tukaj bo treba še sub na topic od task managerja - ta bo tudi povedal katero barvo mora gledati
+        self.color_of_the_cell = None
+
+        self.color_cell_sub = self.create_subscription(
+            String,
+            '/task_manager/color_of_the_cell',
+            self.color_of_the_cell_callback,
+            10,
+        )
 
         self.tile_start_pub = self.create_publisher(Bool, self.tile_detection_start_topic, 10)
         self.tile_stop_pub = self.create_publisher(Bool, self.tile_detection_stop_topic, 10)
-        self.arm_mover_pub = self.create_publisher(String, '/arm_mover/command', 10)
+        self.arm_mover_pub = self.create_publisher(String, '/arm_command', 10)
         self.cmd_vel_pub = self.create_publisher(TwistStamped, 'cmd_vel', 10)
 
         self.get_logger().info('red_green_cell_detection node initialized')
+
+    def color_of_the_cell_callback(self, msg: String):
+        self.color_of_the_cell = msg.data
+        self.get_logger().info(
+            f"Color of the cell received: {self.color_of_the_cell}"
+        )
+
 
     def _has_coordinates(self) -> bool:
         if self.color_of_the_cell == "red":
@@ -123,58 +139,85 @@ class RedGreenCellDetection(Node):
         hue = np.degrees(np.arctan2(B, A)) % 360
         if hue < 42 or hue >= 330:
             return "red"
-        elif 75 <= hue < 145:
+        elif 75 <= hue < 100:
             return "green"
         else:
             return "other"
 
     def detect_line_of_color(self, image: np.ndarray, color: str) -> tuple[int, int] | None:
         """
-        Poišče linijo podane barve ('red' ali 'green') v sliki.
-        Vrne center (cx, cy) največje konture ali None.
+        Detect a red or green line on the floor.
+        Returns the center (cx, cy) of the largest valid contour.
         """
-        # Pretvori v LAB in razdeli na kanale
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+        h, w = image.shape[:2]
+
+        # Only look at the bottom part of the image
+        floor_band_height = 80
+        roi = image[h-floor_band_height:h, :]
+
+        # Convert ROI to LAB
+        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
         L, A, B = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
 
-        # OpenCV LAB: A in B sta shifted [0..255] → centriraj na [-128..127]
-        A -= 128.0
-        B -= 128.0
-
-        # Klasificiraj vsak pixel vektorizirano
-        chroma = np.sqrt(A ** 2 + B ** 2)
+        chroma = np.sqrt(A**2 + B**2)
         hue = np.degrees(np.arctan2(B, A)) % 360
 
         if color == 'red':
             mask = (chroma >= 15) & ((hue < 42) | (hue >= 330))
         elif color == 'green':
-            mask = (chroma >= 15) & (hue >= 75) & (hue < 145)
+            mask = (chroma >= 15) & (hue >= 75) & (hue < 120)
         else:
             return None
 
         mask = mask.astype(np.uint8) * 255
 
-        # Morfološko čiščenje šuma
+        # Remove noise
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
         if not contours:
             return None
 
         largest = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest) < self.min_contour_area:
+
+        area = cv2.contourArea(largest)
+        if area < self.min_contour_area:
+            return None
+
+        # Reject objects that are not line-like
+        x, y, w_box, h_box = cv2.boundingRect(largest)
+
+        aspect_ratio = w_box / h_box
+
+        if aspect_ratio < 2:
+            self.get_logger().info(
+                f"Rejected {color} object because it is too tall "
+                f"(w={w_box}, h={h_box})"
+            )
             return None
 
         M = cv2.moments(largest)
+
         if M['m00'] == 0:
             return None
 
         cx = int(M['m10'] / M['m00'])
-        cy = int(M['m01'] / M['m00'])
-        return (cx, cy)
+        cy_roi = int(M['m01'] / M['m00'])
 
+        # Convert back to image coordinates
+        cy = cy_roi + (h - floor_band_height)
+
+        self.get_logger().info(
+            f"Detected {color} line at ({cx}, {cy}) "
+            f"(hue={hue[cy_roi, cx]:.1f}, chroma={chroma[cy_roi, cx]:.1f}"
+            f"(area={area:.0f}, aspect_ratio={aspect_ratio:.2f})"
+        )
+
+        return (cx, cy)
 
     def camera_callback(self, msg: Image):
         """Handle incoming camera frames."""
@@ -248,6 +291,8 @@ class RedGreenCellDetection(Node):
         self.task_active = False
         self.tile_stop_pub.publish(Bool(data=True))
         self.get_logger().info('Tile detection stop signal sent')
+
+        # ZA DODAT, DA RESETIRA POZICIJO KAMERE
 
         # node se ustavi sam
         self.get_logger().info('Shutting down node...')
