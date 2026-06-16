@@ -30,6 +30,8 @@ import subprocess
 import threading
 import time
 
+import json as _json
+
 try:
     import pyaudio  # type: ignore[import-not-found]
 except Exception:
@@ -56,6 +58,22 @@ TASK_KEYWORDS = {
     "Anomaly detection":         ["tiles", "anomaly", "cell", "anomalies"],
 }
 MIN_TASK_SCORE = 0.45
+
+GRAMMAR = _json.dumps([
+    # Barrels
+    "barrels", "barrel", "inspection", "barrel inspection",
+    # Rings  
+    "rings", "ring", "count rings", "count the rings",
+    # Anomaly
+    "anomaly", "anomaly red", "anomaly green",
+    "red", "red cell", "green", "green cell",
+    # Nothing
+    "nothing", "none",
+    # Confirmation (za ženski dialog)
+    "yes", "i am sure", "sure", "correct",
+    # Fallback
+    "[unk]"
+])
 
 
 def _tokenize(text: str) -> list[str]:
@@ -174,6 +192,8 @@ class TaskNode(Node):
             except Exception as exc:
                 self.get_logger().error(f"Failed to load Vosk model from '{self.model_path}': {exc}")
                 self._vosk_model = None
+
+        self._vosk_grammar = GRAMMAR
 
         self._pa = None
         self._mic_stream = None
@@ -352,6 +372,7 @@ class TaskNode(Node):
         MAX_LISTEN_SEC = 15.0   # absolutni timeout
 
         recognizer = KaldiRecognizer(self._vosk_model, SAMPLE_RATE)
+        recognizer.SetGrammar(self._vosk_grammar)
 
         stream = self._get_mic_stream(SAMPLE_RATE, CHUNK)
         if stream is None:
