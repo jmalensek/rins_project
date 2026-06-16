@@ -111,6 +111,8 @@ class RobotExplorer(Node):
     # BASIC MOTORIC METHODS
 
     # Moves the robot straight for a given distance at a given speed
+    """
+    # AMCL-based move straight method; Unsable, because the amcl topic just doesn't work for some reason
     def move_straight(self, distance: float, speed: float = 0.2, tolerance: float = 0.02) ->None:
         if distance <= 0:
             self.get_logger().error("Distance must be positive.")
@@ -152,8 +154,8 @@ class RobotExplorer(Node):
             stop_msg.header.frame_id = "base_link"
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
-
     """
+
     # Old move straight method using a time-based approach
     def move_straight(self, distance: float, speed: float = 0.2) -> None:
         if distance <= 0:
@@ -182,9 +184,11 @@ class RobotExplorer(Node):
             stop_msg.header.frame_id = 'base_link'
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
-    """
 
     # Turns the robot in place by a given angle (in radians) at a given angular speed
+
+    """
+    # AMCL-based turn method; Unstable, because the amcl topic just doesn't work for some reason
     def turn(self, angle:float, angular_speed:float = 0.5) -> None:
         if angle is None:
             self.get_logger().warn("Turn angle is None; skipping turn command")
@@ -224,8 +228,8 @@ class RobotExplorer(Node):
             stop_msg.header.frame_id = "base_link"
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
-
     """
+
     # Old turn method using a time-based approach
     def turn(self, angle: float, angular_speed: float = 0.5) -> None:
         if angle is None:
@@ -256,7 +260,6 @@ class RobotExplorer(Node):
             stop_msg.header.frame_id = 'base_link'
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
-    """
 
     # Rotates the robot in place by dividing a full circle into equal turns, with a wait time in between
     def rotate(self, turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0) -> None:
@@ -954,6 +957,9 @@ def main(args = None):
                     (-2.9796109425001718, -1.0694166887545653),
                     (-3.26013179610062, -1.1159374308024788)]
 
+    while True:
+        continue
+
     #waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=1.5)
     #print(f"Generated {len(waypoints_task2_sim_area1)} waypoints for area 1")
 
@@ -978,5 +984,3 @@ def main(args = None):
 
 if __name__=="__main__":
     main()
-
-
