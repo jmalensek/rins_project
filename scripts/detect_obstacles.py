@@ -16,7 +16,7 @@ class ObstacleDetector(Node):
 
         # Parameters
         self.declare_parameter("scan_topic", "/scan")
-        self.declare_parameter("obstacle_distance_threshold", 0.4)
+        self.declare_parameter("obstacle_distance_threshold", 0.5)
 
         self.scan_topic = self.get_parameter("scan_topic").value
         self.threshold = self.get_parameter("obstacle_distance_threshold").value
