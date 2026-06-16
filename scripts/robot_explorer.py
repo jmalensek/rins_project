@@ -64,13 +64,15 @@ class RobotExplorer(Node):
         self.status = None
         self.initial_pose_received = False
         self.is_docked = None
-        self.scan_data = None
         self.map_data = None
         self.finished_count = 0
         self.amcl_pose_msg = None
         self._amcl_window = deque()
         self.localisation_streak = 0
+
         self.yellow_ahead = False
+        self.obstacle_ahead = False
+
         self.actively_approaching = False
 
         self._last_bgr = None
@@ -92,8 +94,6 @@ class RobotExplorer(Node):
         self.finished_pub = self.create_publisher(Bool, "/finished", 10)
 
         # SUBSCRIBERS
-        # Laser scan data for obstacle detection and navigation
-        self.create_subscription(LaserScan, '/scan_filtered', self._scan_callback, qos_profile_sensor_data)
 
         # Occupancy grid map data for navigation and waypoint generation
         self.create_subscription(OccupancyGrid, '/map', self._map_callback, map_qos)
@@ -109,6 +109,9 @@ class RobotExplorer(Node):
 
         # Subscription for yellow line detection
         self.create_subscription(Bool, '/yellow_line/ahead', self._yellow_line_callback, 10)
+
+        # Subscription for obstacle detection
+        self.create_subscription(Bool, '/obstacle/ahead', self._obstacle_callback, 10)
 
         # Something something, approaching a person
         self.create_subscription(Bool, '/approach_active', self._approach_callback, 10)
@@ -306,19 +309,11 @@ class RobotExplorer(Node):
             if self.yellow_ahead:
                 self.get_logger().info("Yellow line detected; stopping movement.")
                 break
-            
-            # If an obstacle is detected straight ahead (check narrow wedge of middle ranges) within a given range, stop
-            if self.scan_data is not None:
-                # Check the middle ranges for obstacles
-                len_ranges = len(self.scan_data.ranges)
-                middle_ranges = [
-                    self.scan_data.ranges[i] for i in range(len_ranges//2 - n_half, len_ranges//2 + n_half) 
-                    if not math.isinf(self.scan_data.ranges[i])
-                    ]
-                
-                if min(middle_ranges) < obst_range:
-                    self.get_logger().info("Obstacle detected; stopping movement.")
-                    break
+
+            # If an obstacle is detected within the specified range, stop
+            if self.obstacle_ahead:
+                self.get_logger().info("Obstacle detected ahead; stopping movement.")
+                break
 
             twist_msg.header.stamp = self.get_clock().now().to_msg()
             twist_msg.header.frame_id = 'base_link'
@@ -391,6 +386,9 @@ class RobotExplorer(Node):
         while rclpy.ok() and (self.get_clock().now() - start_time).nanoseconds < timeout_sec * 1e9:
             self.get_logger().info("Moving ahead...")
             self.move_in_area1(speed=speed, timeout_sec=timeout_sec)
+
+            # Wait a short while before turning to allow amcl pose to refresh
+            time.sleep(5.0)
 
             self.get_logger().info("Turning to explore new direction...")
             self.turn(math.pi/2, angular_speed=angular_speed)
@@ -837,11 +835,6 @@ class RobotExplorer(Node):
         return wx, wy
 
     # CALLBACKS
-    def _scan_callback(self, msg: LaserScan) -> None:
-        try:
-            self.scan_data = msg
-        except Exception:
-            self.get_logger().warn('Received malformed scan message')
 
     def _map_callback(self, msg: OccupancyGrid) -> None:
         try:
@@ -868,6 +861,12 @@ class RobotExplorer(Node):
             self.yellow_ahead = bool(msg.data)
         except Exception:
             self.get_logger().warn('Received malformed /yellow_line/ahead message')
+
+    def _obstacle_callback(self, msg: Bool) -> None:
+        try:
+            self.obstacle_ahead = bool(msg.data)
+        except Exception:
+            self.get_logger().warn('Received malformed /obstacle/ahead message')
 
     def _image_callback(self, msg: Image) -> None:
         try:
@@ -1009,19 +1008,14 @@ def main(args = None):
     #waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=1.5)
     #print(f"Generated {len(waypoints_task2_sim_area1)} waypoints for area 1")
 
-    #re.move_straight(distance=0.5, speed=0.2)
-
-    #re.turn(-math.pi/2)
-    re.move_in_area1(speed=0.2, timeout_sec=30.0)
-    #re.turn(math.pi/2)
-    #re.move_in_area1(speed=0.2, timeout_sec=30.0)
+    #re.explore_area1()
 
     # TASK 2
     # For line detection run detect_yellow_line.py and arm_mover_actions.py
     # For best view of both the yellow and blue line 
-    #re.cover_waypoints(waypoints_task2_sim_area1, localise=False)
-    #re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
-    #re.follow_blue_line()
+    re.cover_waypoints(waypoints_task2_sim_area1, localise=False)
+    re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
+    re.follow_blue_line()
 
     # TASK 1R
     #re.cover_waypoints(waypoints_irl, wait_time=0.5, localise=True)
