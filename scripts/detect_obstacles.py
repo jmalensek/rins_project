@@ -16,10 +16,14 @@ class ObstacleDetector(Node):
 
         # Parameters
         self.declare_parameter("scan_topic", "/scan")
-        self.declare_parameter("obstacle_distance_threshold", 0.5)
+        self.declare_parameter("obstacle_detected_distance_threshold", 0.25)
+        self.declare_parameter("obstacle_ahead_distance_threshold", 0.5)
+        self.declare_parameter("window_size", 50)
 
         self.scan_topic = self.get_parameter("scan_topic").value
-        self.threshold = self.get_parameter("obstacle_distance_threshold").value
+        self.detected_threshold = self.get_parameter("obstacle_detected_distance_threshold").value
+        self.ahead_threshold = self.get_parameter("obstacle_ahead_distance_threshold").value
+        self.window_size = self.get_parameter("window_size").value
 
         scan_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -37,7 +41,7 @@ class ObstacleDetector(Node):
         self.pub_detected = self.create_publisher(Bool, "/obstacle/detected", 10)
         self.pub_ahead = self.create_publisher(Bool, "/obstacle/ahead", 10)
 
-        self.get_logger().info(f"Obstacle detector started on {self.scan_topic}")
+        self.get_logger().info(f"Obstacle detector started. Subscribing to {self.scan_topic}")
 
     def _scan_callback(self, msg: LaserScan):
         ranges = np.array(msg.ranges, dtype=np.float32)
@@ -48,10 +52,9 @@ class ObstacleDetector(Node):
 
         # Take center window (front of robot), 1/4 of the scan range I guess
         mid = len(msg.ranges) // 4
-        window_size = 20  # adjust (10–50 typical)
 
-        start = max(0, mid - window_size)
-        end = min(len(msg.ranges), mid + window_size)
+        start = max(0, mid - self.window_size)
+        end = min(len(msg.ranges), mid + self.window_size)
 
         front_ranges = np.array(msg.ranges[start:end], dtype=np.float32)
         front_ranges = front_ranges[np.isfinite(front_ranges)]
@@ -60,9 +63,10 @@ class ObstacleDetector(Node):
             return
 
         min_dist = np.min(front_ranges)
+        min_dist_all = np.min(ranges)
 
-        obstacle_ahead = min_dist < self.threshold
-        obstacle_detected = np.any(ranges < self.threshold)
+        obstacle_ahead = min_dist < self.ahead_threshold
+        obstacle_detected = min_dist_all < self.detected_threshold
 
         # Publish
         msg_ahead = Bool()
@@ -76,6 +80,9 @@ class ObstacleDetector(Node):
         # Optional logging (avoid spam)
         if obstacle_ahead:
             self.get_logger().warn(f"Obstacle ahead; distance={min_dist:.2f} m")
+
+        if obstacle_detected:
+            self.get_logger().warn(f"Obstacle detected; min distance={min_dist_all:.2f} m")
 
 
 def main(args=None):
