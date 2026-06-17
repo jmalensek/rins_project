@@ -124,6 +124,23 @@ class detect_tiles(Node):
             self.destroy_node()
             rclpy.shutdown()
 
+    def order_points(self, pts):
+        """
+        Orders points as:
+        top-left, top-right, bottom-right, bottom-left
+        """
+        rect = np.zeros((4, 2), dtype=np.float32)
+
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]  # top-left
+        rect[2] = pts[np.argmax(s)]  # bottom-right
+
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]  # top-right
+        rect[3] = pts[np.argmax(diff)]  # bottom-left
+
+        return rect
+
     def print_detected_tiles(self):
         print(f"Total tiles: {self.tiles['total']}")
         print(f"Anomalous tiles: {self.tiles['anomalous']}")
@@ -160,15 +177,31 @@ class detect_tiles(Node):
         return tiles
 
     def get_perspective_transform(self, contour, tile_size=512):
-        dst_points = np.array([[0, 0], [tile_size, 0], [tile_size, tile_size], [0, tile_size]], dtype=np.float32)
 
-        contour = contour.reshape(4, 2).astype(np.float32)
+        if contour is None:
+            raise ValueError("Contour is None")
 
-        top = contour[:2][np.argsort(contour[:2, 0])]
-        bottom = contour[2:][np.argsort(contour[2:, 0])]
-        src_points = np.stack([top, bottom[::-1]]).astype(np.float32)
+        if len(contour) != 4:
+            raise ValueError(
+                f"Expected 4 contour points, got {len(contour)}"
+            )
 
-        H = cv2.getPerspectiveTransform(src_points, dst_points)
+        pts = contour.reshape(4, 2).astype(np.float32)
+
+        src_points = self.order_points(pts)
+
+        dst_points = np.array([
+            [0, 0],
+            [tile_size - 1, 0],
+            [tile_size - 1, tile_size - 1],
+            [0, tile_size - 1]
+        ], dtype=np.float32)
+
+        H = cv2.getPerspectiveTransform(
+            src_points,
+            dst_points
+        )
+
         return H
     
     def warp_tile(self, image, H, tile_size=512):
@@ -435,9 +468,22 @@ class detect_tiles(Node):
                 epsilon = 0.02 * cv2.arcLength(contour, True)
                 approx = cv2.approxPolyDP(contour, epsilon, True)
 
-                if len(approx) == 4:
-                    tiles.append(approx)
+                if len(approx) != 4:
+                    continue
 
+                x, y, w, h = cv2.boundingRect(approx)
+
+                aspect_ratio = w / float(h)
+
+                if not (0.7 < aspect_ratio < 1.3):
+                    continue
+
+                tiles.append(approx)
+
+        for idx, tile in enumerate(tiles):
+            self.get_logger().info(
+                f"Tile {idx}: shape={tile.shape}, area={cv2.contourArea(tile)}"
+            )
         return tiles
 
     def get_perspective_transform(self, contour, tile_size=512):
@@ -492,6 +538,19 @@ class detect_tiles(Node):
         
         tiles_contours = self.detect_tiles(cv_image)
 
+        debug_image = cv_image.copy()
+
+        cv2.drawContours(
+            debug_image,
+            tiles_contours,
+            -1,
+            (0, 255, 0),
+            3
+        )
+
+        cv2.imshow("Detected Tiles", debug_image)
+        cv2.waitKey(1)
+
         if not tiles_contours:
             self.get_logger().info("No tiles detected in the image.")
             return
@@ -517,6 +576,16 @@ class detect_tiles(Node):
         for idx, contour in enumerate(tiles_contours):
 
             try:
+                self.get_logger().info(
+                    f"Processing tile {idx}, contour shape: {contour.shape}"
+                )
+
+                pts = contour.reshape(-1, 2)
+
+                self.get_logger().info(
+                    f"Points: {pts.tolist()}"
+                )
+
                 H = self.get_perspective_transform(contour, self.tile_size)
                 warped_tile = self.warp_tile(cv_image, H, self.tile_size)
                 
