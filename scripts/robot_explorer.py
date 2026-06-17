@@ -13,17 +13,16 @@ from geometry_msgs.msg import PoseStamped, Quaternion
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import TwistStamped
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import Bool
 
 import rclpy
 from rclpy.action import ActionClient
-from rclpy.duration import Duration as rclpyDuration
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
-from rclpy.qos import qos_profile_sensor_data
+
+from nav_msgs.msg import Odometry
 
 import numpy as np
 import cv2
@@ -60,18 +59,25 @@ class RobotExplorer(Node):
         # FLAGS AND STATE VARIABLES
         self.goal_handle = None
         self.result_future = None
+
         self.feedback = None
         self.status = None
         self.initial_pose_received = False
         self.is_docked = None
         self.map_data = None
         self.finished_count = 0
+
         self.amcl_pose_msg = None
         self._amcl_window = deque()
         self.localisation_streak = 0
 
+        self.current_odom_yaw = None
+        self.current_odom_position = None
+        self.current_odom_velocity = None
+
         self.yellow_ahead = False
         self.obstacle_ahead = False
+        self.obstacle_detected = False
 
         self.actively_approaching = False
 
@@ -104,6 +110,9 @@ class RobotExplorer(Node):
         # AMCL pose estimates for localisation and navigation feedback
         self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self._amcl_pose_callback, amcl_qos)
 
+        # Odometry data for movment
+        self.create_subscription(Odometry, '/odom', self._odom_callback, 10)
+
         # Camera images for line following and visual processing
         self.create_subscription(Image, "/top_camera/rgb/preview/image_raw", self._image_callback, image_qos)
 
@@ -111,7 +120,8 @@ class RobotExplorer(Node):
         self.create_subscription(Bool, '/yellow_line/ahead', self._yellow_line_callback, 10)
 
         # Subscription for obstacle detection
-        self.create_subscription(Bool, '/obstacle/ahead', self._obstacle_callback, 10)
+        self.create_subscription(Bool, '/obstacle/ahead', self._obstacle_ahead_callback, 10)
+        self.create_subscription(Bool, '/obstacle/detected', self._obstacle_detected_callback, 10)
 
         # Something something, approaching a person
         self.create_subscription(Bool, '/approach_active', self._approach_callback, 10)
@@ -127,14 +137,63 @@ class RobotExplorer(Node):
     # BASIC MOTORIC METHODS
 
     # Moves the robot straight for a given distance at a given speed
-    
-    # AMCL-based move straight method; Unsable, because the amcl topic just doesn't work for some reason
-    def move_straight(self, distance: float, speed: float = 0.2, tolerance: float = 0.02) ->None:
+
+    # Odometry-based move straight method
+    def move_straight_odom(self, distance: float, speed: float = 0.2, tolerance: float = 0.02) -> None:
         if distance <= 0:
             self.get_logger().error("Distance must be positive.")
             return
         
-        start_position = self.get_current_position()
+        start_position = self.get_current_position_odom()
+        if start_position is None:
+            self.get_logger().warn("Current position is None; cannot perform move_straight")
+            return
+        
+        speed = abs(speed)
+
+        last_position = start_position
+        accumulated_distance = 0.0
+
+        twist = TwistStamped()
+        stop = TwistStamped()
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.01)
+
+            current_position = self.get_current_position_odom()
+            if current_position is None:
+                self.get_logger().warn("Current position is None; cannot perform move_straight")
+                break
+
+            delta = self.compute_distance(last_position, current_position)
+            last_position = current_position
+            accumulated_distance += delta
+            remaining_distance = distance - accumulated_distance
+
+            if remaining_distance <= tolerance:
+                break
+
+            cmd_speed = min(speed, max(0.03, remaining_distance*2.0))
+
+            twist.twist.linear.x = cmd_speed
+            twist.header.stamp = self.get_clock().now().to_msg()
+            twist.header.frame_id = "base_link"
+
+            self.cmd_vel_pub.publish(twist)
+
+        for _ in range(3):
+            stop.header.stamp = self.get_clock().now().to_msg()
+            stop.header.frame_id = "base_link"
+            self.cmd_vel_pub.publish(stop)
+            time.sleep(0.05)
+    
+    # AMCL-based move straight method; Very unreliable due to inaccuracy
+    def move_straight_amcl(self, distance: float, speed: float = 0.2, tolerance: float = 0.02) ->None:
+        if distance <= 0:
+            self.get_logger().error("Distance must be positive.")
+            return
+        
+        start_position = self.get_current_position_amcl()
         if start_position is None:
             self.get_logger().warn("Current position is None; cannot perform move_straight")
             return
@@ -149,7 +208,7 @@ class RobotExplorer(Node):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.0)
 
-            current_position = self.get_current_position()
+            current_position = self.get_current_position_amcl()
             if current_position is None:
                 self.get_logger().warn("Current position is None; cannot perform move_straight")
                 break
@@ -170,10 +229,10 @@ class RobotExplorer(Node):
             stop_msg.header.frame_id = "base_link"
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
-    
-    """
-    # Old move straight method using a time-based approach
-    def move_straight(self, distance: float, speed: float = 0.2) -> None:
+            
+    # Time-based move straight method.
+    # Doesn't work in the simulation, because time works differently there for some reason.
+    def move_straight_time(self, distance: float, speed: float = 0.2) -> None:
         if distance <= 0:
             self.get_logger().error("Distance must be positive.")
             return
@@ -202,10 +261,59 @@ class RobotExplorer(Node):
             time.sleep(0.05)
 
     # Turns the robot in place by a given angle (in radians) at a given angular speed
-    """
 
-    # AMCL-based turn method; Unstable, because the amcl topic just doesn't work for some reason
-    def turn(self, angle:float, angular_speed:float = 0.5) -> None:
+    # Odometry-based turn method
+    def turn_odom(self, angle: float, angular_speed: float = 0.5, tolerance: float = 0.5) -> None:
+        if angle is None:
+            self.get_logger().warn("Turn angle is None; skipping turn command")
+            return
+        
+        # Only angles in the range [-pi, pi] are valid for turning
+        if angle > math.pi or angle < -math.pi:
+            self.get_logger().warn(f"Turn angle {angle:.2f} rad is out of range [-pi, pi]; skipping turn command")
+            return
+
+        start_yaw = self.get_current_yaw_odom()
+        if start_yaw is None:
+            self.get_logger().warn("Current yaw is None; cannot perform turn")
+            return
+        
+        last_yaw = start_yaw
+        accumulated_angle = 0.0
+
+        twist = TwistStamped()
+        stop = TwistStamped()
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+            current_yaw = self.get_current_yaw_odom()
+            if current_yaw is None:
+                self.get_logger().warn("Current yaw is None; cannot perform turn")
+                break
+
+            delta = self.normalize_angle(current_yaw - last_yaw)
+            accumulated_angle += delta
+            last_yaw = current_yaw
+            remaining_angle = abs(angle) - abs(accumulated_angle)
+
+            if remaining_angle <= math.radians(tolerance):
+                break
+
+            speed = min(angular_speed, max(0.05, remaining_angle*2.0))
+            twist.twist.angular.z = speed if angle > 0 else -speed
+            twist.header.stamp = self.get_clock().now().to_msg()
+            twist.header.frame_id = "base_link"
+            self.cmd_vel_pub.publish(twist)
+
+        for _ in range(3):
+            stop.header.stamp = self.get_clock().now().to_msg()
+            stop.header.frame_id = "base_link"
+            self.cmd_vel_pub.publish(stop)
+            time.sleep(0.05)
+
+    # AMCL-based turn method; Very unreliable die to inacurracy
+    def turn_amcl(self, angle:float, angular_speed:float = 0.5) -> None:
         if angle is None:
             self.get_logger().warn("Turn angle is None; skipping turn command")
             return
@@ -215,7 +323,7 @@ class RobotExplorer(Node):
             self.get_logger().warn(f"Turn angle {angle:.2f} rad is out of range [-pi, pi]; skipping turn command")
             return
         
-        start_yaw = self.get_current_yaw()
+        start_yaw = self.get_current_yaw_amcl()
         if start_yaw is None:
             self.get_logger().warn("Current yaw is None; cannot perform turn")
             return
@@ -228,7 +336,7 @@ class RobotExplorer(Node):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.0)
 
-            current_yaw = self.get_current_yaw()
+            current_yaw = self.get_current_yaw_amcl()
             if current_yaw is None:
                 self.get_logger().warn("Current yaw is None; cannot perform turn")
                 break
@@ -250,9 +358,9 @@ class RobotExplorer(Node):
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
 
-    """
-    # Old turn method using a time-based approach
-    def turn(self, angle: float, angular_speed: float = 0.5) -> None:
+    # Time-based turn method.
+    # Doesn't work in the simulation, because time works differently there for some reason.
+    def turn_time(self, angle: float, angular_speed: float = 0.5) -> None:
         if angle is None:
             self.get_logger().warn("Turn angle is None; skipping turn command")
             return
@@ -287,18 +395,17 @@ class RobotExplorer(Node):
             angle = (2 * math.pi) / turns
 
             for _ in range(turns):
-                self.turn(angle, angular_speed)
+                self.turn_odom(angle, angular_speed)
                 time.sleep(wait_time)
-    """
                 
-     # Moves the robot straight ahead at a given speed until it either detects an obstacle or a yellow line
-    def move_in_area1(self, speed: float = 0.2, obst_range: float = 0.1, range_sample_n: int = 3, timeout_sec: float = 30.0) -> None:
+    # Moves the robot straight ahead at a given speed until it either detects an obstacle or a yellow line
+    # Since the stopic criteria is event driven (spotting either an obstacle or a yellow line), no specific approach for distance is used
+    # Returns whether the robot stopped due to an obstacle or a yellow line
+    def move_in_area1(self, speed: float = 0.2, timeout_sec: float = 30.0) -> None:
         speed = abs(speed)
 
         twist_msg = TwistStamped()
         twist_msg.twist.linear.x = speed
-
-        n_half = range_sample_n//2
 
         stop_msg = TwistStamped()
 
@@ -342,9 +449,9 @@ class RobotExplorer(Node):
             return False
 
         mx, my = map_cell
-        if self._cell(mx, my) != 0:
+        if self.cell(mx, my) != 0:
             self.get_logger().warn(
-                f"Goal ({x:.2f}, {y:.2f}) is not in free space (map cell value: {self._cell(mx, my)})"
+                f"Goal ({x:.2f}, {y:.2f}) is not in free space (map cell value: {self.cell(mx, my)})"
                 )
             return False
 
@@ -357,7 +464,7 @@ class RobotExplorer(Node):
         goal_pose.header.stamp = self.get_clock().now().to_msg()
         goal_pose.pose.position.x = float(x)
         goal_pose.pose.position.y = float(y)
-        goal_pose.pose.orientation = self._yaw_to_quaternion(yaw)
+        goal_pose.pose.orientation = self.yaw_to_quaternion(yaw)
 
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = goal_pose
@@ -377,21 +484,137 @@ class RobotExplorer(Node):
     # NAVIGATION METHODS
 
     # Move through area1 while avoiding obstacles and the yellow line
-    def explore_area1(self, speed: float = 0.2, angular_speed: float = 1.0, timeout_sec: float = 120.0) -> None:
+
+    # A wall bouncing approach, where the robot moves straight until it detects an obstacle or a yellow line, 
+    # then turns left or right and continues moving straight, repeating this process until a timeout is reached
+    def explore_area1_bounce(self, speed: float = 0.2, angular_speed: float = 1.0, timeout_sec: float = 240.0, move_timeout_sec: float = 10.0) -> None:
+        self.get_logger().info("Starting exploration of area 1...")
+
+        start_time = self.get_clock().now()
+        
+        # Detrmines the pi/2 turn direction. True is left, and right is false. After every turn the value is flipped.
+        left_right = True 
+
+        # Move straight ahead until an obstacle or yellow line is detected, then turn left/right and repeat until timeout
+        while rclpy.ok() and (self.get_clock().now() - start_time).nanoseconds < timeout_sec * 1e9:
+
+            # Some new active approach interruption mechanism, that I don't fully understand
+            while self.actively_approaching:
+                self.get_logger().info("Active approach in progress, waiting...")
+
+                # Wait a short while before checking again
+                rclpy.spin_once(self, timeout_sec=0.1)
+
+            self.get_logger().info("Moving ahead...")
+            self.move_in_area1(speed=speed, timeout_sec=move_timeout_sec)
+
+            # Wait a short while before turning to allow amcl pose to refresh
+            rclpy.spin_once(self, timeout_sec=0.5)
+
+            self.get_logger().info("Turning to explore new direction...")
+
+            if left_right:
+                self.turn_odom(math.pi/2, angular_speed=angular_speed)
+            else:
+                self.turn_odom(-math.pi/2, angular_speed=angular_speed)
+
+            left_right = not left_right
+
+    # A more random turn approach with bias towards less visited turn angles
+    def explore_area1_random(self, speed: float = 0.2, angular_speed: float = 1.0, timeout_sec: float = 240.0, move_timeout_sec: float = 10.0) -> None:
         self.get_logger().info("Starting exploration of area 1...")
 
         start_time = self.get_clock().now()
 
-        # Move straight ahead until an obstacle or yellow line is detected, then turn left/right and repeat until timeout
+        turn_angles = [math.pi/4, math.pi/2, 3*math.pi/4, math.pi, -math.pi/4, -math.pi/2, -3*math.pi/4]
+        angle_visits = {angle: 0 for angle in turn_angles}
         while rclpy.ok() and (self.get_clock().now() - start_time).nanoseconds < timeout_sec * 1e9:
+
+            # Some new active approach interruption mechanism, that I don't fully understand
+            while self.actively_approaching:
+                self.get_logger().info("Active approach in progress, waiting...")
+
+                # Wait a short while before checking again
+                rclpy.spin_once(self, timeout_sec=0.1)
+
             self.get_logger().info("Moving ahead...")
-            self.move_in_area1(speed=speed, timeout_sec=timeout_sec)
+            self.move_in_area1(speed=speed, timeout_sec=move_timeout_sec)
 
             # Wait a short while before turning to allow amcl pose to refresh
-            time.sleep(5.0)
+            rclpy.spin_once(self, timeout_sec=0.5)
 
             self.get_logger().info("Turning to explore new direction...")
-            self.turn(math.pi/2, angular_speed=angular_speed)
+            min_visits = min(angle_visits.values())
+
+            least_used = [angle for angle, count in angle_visits.items() if count == min_visits]
+
+            angle = np.random.choice(least_used)
+
+            angle_visits[angle] += 1
+            self.turn_odom(angle, angular_speed=angular_speed)
+
+    # Sequentially visits a set of waypoints on a provided map
+    # In area1 of task2, the robot is to avoid crossing the yellow line, so a special method is used
+    def cover_waypoints_area1(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0, localise: bool = True) -> None:
+        for index, (x, y) in enumerate(waypoints):
+
+            """
+            # Basic /finished signal interruption mechanism
+            if self.finished_count > 0:
+                self.get_logger().info("Interrupt signal received, waiting...")
+
+                # Publish a /finished message to signal interruption to other nodes
+                self.finished_pub.publish(Bool(data=True))
+                self.get_logger().info("Published /finished=True to signal interruption to other nodes.")
+
+                # Waits for the next /finished message to arrive
+                while self.finished_count < 2:
+                    rclpy.spin_once(self, timeout_sec=0.1)
+
+                self.get_logger().info("Resuming waypoint coverage...")
+                self.finished_count = 0
+            """
+
+            # Some new active approach interruption mechanism, that I don't fully understand
+            while self.actively_approaching:
+                self.get_logger().info("Active approach in progress, waiting...")
+
+                # Wait a short while before checking again
+                rclpy.spin_once(self, timeout_sec=0.1)
+
+            # Compute the yaw angle to face at the next waypoint
+            yaw = 0.0
+            if index < len(waypoints) - 1:
+                yaw = self.compute_absolute_yaw((x, y), waypoints[index + 1])
+            elif index > 0:
+                yaw = self.compute_absolute_yaw(waypoints[index - 1], (x, y))
+
+            self.get_logger(). info(f"Navigating to waypoint ({x:.2f}, {y:.2f}) with yaw {yaw:.2f} rad")
+            self.speak(f"Navigating to new location.")
+
+            # Rotate to help with localisation
+            if localise:
+                self.rotate(turns, angular_speed, wait_time)
+
+            # Compute the yaw for the next
+
+            if not self.go_to_pose(x, y, yaw):
+                self.get_logger().error(f"Failed to send goal to ({x:.2f}, {y:.2f})")
+                continue
+            
+            while rclpy.ok():
+                rclpy.spin_once(self, timeout_sec=0.0)
+
+                if self.yellow_ahead and self.is_moving():
+                    self.get_logger().info("Yellow line detected ahead; stopping movement.")
+                    cancel_future = self.goal_handle.cancel_goal_async()
+                    rclpy.spin_until_future_complete(self, cancel_future)
+                    self.turn_odom(math.pi/2, angular_speed=angular_speed)
+                    break
+
+                if self.result_future.done():
+                    self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
+                    break
 
     # Sequentially visits a set of waypoints on a provided map
     def cover_waypoints(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0, localise: bool = True) -> None:
@@ -535,7 +758,7 @@ class RobotExplorer(Node):
                             publish_cmd(0.0, 0.0)
                             time.sleep(0.05)
 
-                        self.turn(math.pi/2, angular_speed=max(0.2, max_angular_speed))
+                        self.turn_odom(math.pi/2, angular_speed=max(0.2, max_angular_speed))
                         uturn_attempts += 1
                         lost_time = 0.0
                         time.sleep(loop_dt)
@@ -639,13 +862,20 @@ class RobotExplorer(Node):
         return math.atan2(target_y, target_x)
     
     # Get the yaw of the robot's current position
-    def get_current_yaw(self) -> float:
+    def get_current_yaw_amcl(self) -> float:
         if self.amcl_pose_msg is None:
             self.get_logger().warn("AMCL pose not received yet")
             return None
         
         q = self.amcl_pose_msg.pose.pose.orientation
-        return self._quaternion_to_yaw(q)
+        return self.quaternion_to_yaw(q)
+    
+    def get_current_yaw_odom(self) -> float:
+        if self.current_odom_yaw is None:
+            self.get_logger().warn("Odometry data not received yet")
+            return None
+        
+        return self.current_odom_yaw
     
     # Normalise an angle to the range [-pi, pi]
     def normalize_angle(self, angle: float) -> float:
@@ -659,7 +889,7 @@ class RobotExplorer(Node):
     def compute_distance(self, pose1: tuple[float, float], pose2: tuple[float, float]) -> float:
         x1, y1 = pose1
         x2, y2 = pose2
-        return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        return math.hypot(x2 - x1, y2 - y1)
     
     # Computes the distance to a relative target pose
     # The coordinates of the target pose are relative, i.e. current pose is (0,0)
@@ -668,7 +898,7 @@ class RobotExplorer(Node):
         return math.sqrt(target_x ** 2 + target_y ** 2)
 
     # Get the robot's current position
-    def get_current_position(self) -> tuple[float, float]:
+    def get_current_position_amcl(self) -> tuple[float, float]:
         if self.amcl_pose_msg is None:
             self.get_logger().warn("AMCL pose not received yet")
             return None
@@ -676,6 +906,20 @@ class RobotExplorer(Node):
         x = self.amcl_pose_msg.pose.pose.position.x
         y = self.amcl_pose_msg.pose.pose.position.y
         return (x, y)
+    
+    def get_current_position_odom(self) -> tuple[float, float]:
+        if self.current_odom_position is None:
+            self.get_logger().warn("Odometry data not received yet")
+            return None
+        
+        return self.current_odom_position
+    
+    def is_moving(self, threshold=0.02):
+        vx, vy, _ = self.current_odom_velocity
+
+        linear_speed = math.sqrt(vx**2 + vy**2)
+
+        return linear_speed > threshold
 
     # Checks whether amcl pose is stable an the robot is well-localised
     def is_localised(self, pos_threshold: float = 0.2, yaw_threshold: float = 0.2, min_streak: int = 3) -> bool:
@@ -715,7 +959,7 @@ class RobotExplorer(Node):
                 x_iter = reversed(x_iter)
             
             for mx in x_iter:
-                if self._cell(mx, my) == 0:
+                if self.cell(mx, my) == 0:
                     wx, wy = self._map_to_world(mx, my)
                     waypoints.append((wx, wy))
 
@@ -723,7 +967,7 @@ class RobotExplorer(Node):
         return waypoints
 
     # Helper method to convert yaw angle to quaternion for goal pose
-    def _yaw_to_quaternion(self, yaw: float) -> Quaternion:
+    def yaw_to_quaternion(self, yaw: float) -> Quaternion:
         q = Quaternion()
         q.x = 0.0
         q.y = 0.0
@@ -731,7 +975,7 @@ class RobotExplorer(Node):
         q.w = math.cos(yaw * 0.5)
         return q
 
-    def _quaternion_to_yaw(self, q: Quaternion) -> float:
+    def quaternion_to_yaw(self, q: Quaternion) -> float:
         return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
     # Waits for scan data to be received, with a timeout
@@ -780,7 +1024,7 @@ class RobotExplorer(Node):
             rclpy.spin_once(self, timeout_sec=0.1)
 
     # Helper method to get the occupancy value of a cell in the map
-    def _cell(self, mx: int, my: int) -> int:
+    def cell(self, mx: int, my: int) -> int:
         w = self.map_data.info.width
         return self.map_data.data[my * w + mx]
     
@@ -855,6 +1099,14 @@ class RobotExplorer(Node):
         except Exception:
             self.get_logger().warn('Received malformed amcl_pose message')
 
+    def _odom_callback(self, msg: Odometry) -> None:
+        try:
+            self.current_odom_yaw = self.quaternion_to_yaw(msg.pose.pose.orientation)
+            self.current_odom_position = (msg.pose.pose.position.x, msg.pose.pose.position.y)
+            self.current_odom_velocity = (msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.angular.z)
+        except Exception:
+            self.get_logger().warn('Received malformed odometry message')
+
     def _yellow_line_callback(self, msg: Bool) -> None:
         # store latest detection state
         try:
@@ -862,11 +1114,17 @@ class RobotExplorer(Node):
         except Exception:
             self.get_logger().warn('Received malformed /yellow_line/ahead message')
 
-    def _obstacle_callback(self, msg: Bool) -> None:
+    def _obstacle_ahead_callback(self, msg: Bool) -> None:
         try:
             self.obstacle_ahead = bool(msg.data)
         except Exception:
             self.get_logger().warn('Received malformed /obstacle/ahead message')
+
+    def _obstacle_detected_callback(self, msg: Bool) -> None:
+        try:
+            self.obstacle_detected = bool(msg.data)
+        except Exception:
+            self.get_logger().warn('Received malformed /obstacle/detected message')
 
     def _image_callback(self, msg: Image) -> None:
         try:
@@ -938,7 +1196,7 @@ def main(args = None):
     spin_thread.start()
 
     # now your code can run normally
-    time.sleep(3.0)
+    rclpy.spin_once(re, timeout_sec=10.0)
 
     # Wait for map data
     if not re.wait_for_map_data(timeout_sec=10.0):
@@ -957,11 +1215,13 @@ def main(args = None):
     #re.localise_self()
 
     # hardcoded waypoints for the specific map
-    area1_lower_bound = (0.7719925413173669, -4.4194223905944074)
-    area1_upper_bound = (-4.644132348851085, 0.27827839427878537)
+    area1_lower_bound = (-4.075931584273279, -0.32869288263557733)
+    area1_upper_bound = (0.5012251325539632, -4.484576582824663)
     blue_line_start = (2.797641390882936, 0.19569027139125528)
 
-    blue_line_start_quaternion_yaw = re._quaternion_to_yaw(Quaternion(x=-0.0, y=0.0, z=0.707, w=0.707))
+    behind_boundary_test_point = (0.07849085761053862, -2.013457906741135)
+
+    blue_line_start_quaternion_yaw = re.quaternion_to_yaw(Quaternion(x=-0.0, y=0.0, z=0.707, w=0.707))
 
     waypoints_task1_sim = [
         (1.8396370262122645, -0.5751383533952286),
@@ -1005,16 +1265,22 @@ def main(args = None):
                     (-2.9796109425001718, -1.0694166887545653),
                     (-3.26013179610062, -1.1159374308024788)]
 
-    #waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=1.5)
+    #waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=1.3)
     #print(f"Generated {len(waypoints_task2_sim_area1)} waypoints for area 1")
 
-    #re.explore_area1()
+    # Turn right
+    #re.turn_odom(-math.pi/2, angular_speed=0.5)
+    #re.explore_area1_random()
 
     # TASK 2
     # For line detection run detect_yellow_line.py and arm_mover_actions.py
-    # For best view of both the yellow and blue line 
+    # For best view of both the yellow and blue line
+    #re.cover_waypoints_area1(waypoints_task2_sim_area1, localise=False)
+
     re.cover_waypoints(waypoints_task2_sim_area1, localise=False)
+
     re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
+
     re.follow_blue_line()
 
     # TASK 1R
