@@ -25,7 +25,6 @@ Zamenjava za mikrofon: samo funkcijo _listen_for_task() zamenjamo z STT klicem.
 
 from datetime import datetime
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -40,11 +39,6 @@ except Exception:
     _fuzz = None  # type: ignore[assignment]
 
 try:
-    import sounddevice as sd  # type: ignore[import-not-found]
-except Exception:
-    sd = None  # type: ignore[assignment]
-
-try:
     from vosk import Model, KaldiRecognizer  # type: ignore[import-not-found]
 except Exception:
     Model = None  # type: ignore[assignment]
@@ -55,8 +49,14 @@ from rclpy.node import Node
 from std_msgs.msg import String, Bool
 from std_srvs.srv import Trigger
 
+from reportlab.lib import colors as rl_colors
 from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    Image as RLImage, Paragraph, SimpleDocTemplate,
+    Spacer, Table, TableStyle,
+)
 
 
 TASK_KEYWORDS = {
@@ -137,18 +137,9 @@ class TaskNode(Node):
                 self.get_logger().error(f"Failed to load Vosk model from '{self.model_path}': {exc}")
                 self._vosk_model = None
 
-        self._vosk_grammar = GRAMMAR
-
-        self._sd = None
-        self._mic_stream = None
-        self._mic_lock = threading.Lock()
+        self._arecord_proc: subprocess.Popen | None = None
+        self._arecord_lock = threading.Lock()
         self._mic_suppressed_until = 0.0
-        if sd is not None:
-            try:
-                self._sd = sd
-            except Exception as exc:
-                self.get_logger().error(f"Failed to initialize sounddevice: {exc}")
-                self._sd = None
 
         # Trenutna oseba
         self.current_person: str | None = None
@@ -171,105 +162,35 @@ class TaskNode(Node):
         self.start_task_anomaly_pub = self.create_publisher(Bool, "/task_manager/task_started", 10)
         self.color_of_the_cell_pub = self.create_publisher(String, "/task_manager/color_of_the_cell", 10)
         
-        # DODANO ŠE DA SI SHRANI KATERA BARVA JE PRI ANOMALY DETECTION -
-        # treba še actually inplementirat katera barva, tu je samo placeholder
         self.color_of_the_cell = None
-        
+
+        # Mape s slikami (ime slike = ID objekta, npr. 1.jpg)
+        self.barrels_img_dir = "./barrels"
+        self.tiles_img_dir   = "./tiles"
+
+        # Rezultati nalog: {ime_osebe: dict z rezultati}
+        self.task_results: dict[str, dict] = {}
+
         self.create_service(Trigger, "/get_tasks", self._get_tasks_srv)
 
         self.get_logger().info("Task_manager starting.")
 
 
-    def _get_mic_stream(self, sample_rate: int, chunk: int):
-        """Get (or open) a persistent microphone input stream."""
-        if self._sd is None:
-            return None
-
-        with self._mic_lock:
-            if self._mic_stream is not None:
-                return self._mic_stream
-
-            try:
-                device_index = int(self.get_parameter("mic_device_index").value)
-            except Exception:
-                device_index = -1
-
-            open_kwargs = {}
-            if device_index >= 0:
-                open_kwargs["device"] = device_index
-
-            try:
-                # Use RawInputStream so we get bytes similar to PyAudio's stream.read()
-                raw = self._sd.RawInputStream(
-                    samplerate=sample_rate,
-                    blocksize=chunk,
-                    channels=1,
-                    dtype='int16',
-                    **open_kwargs,
-                )
-
-                class SoundDeviceStream:
-                    def __init__(self, raw_stream):
-                        self._raw = raw_stream
-
-                    def start_stream(self):
-                        try:
-                            self._raw.start()
-                        except Exception:
-                            pass
-
-                    def read(self, frames, exception_on_overflow=False):
-                        # RawInputStream.read(frames) -> (data, overflowed)
-                        data, overflowed = self._raw.read(frames)
-                        return data
-
-                    def stop_stream(self):
-                        try:
-                            self._raw.stop()
-                        except Exception:
-                            pass
-
-                    def close(self):
-                        try:
-                            self._raw.close()
-                        except Exception:
-                            pass
-
-                self._mic_stream = SoundDeviceStream(raw)
-                return self._mic_stream
-            except Exception as exc:
-                self.get_logger().error(f"Failed to open microphone input stream (sounddevice): {exc}")
-                self._mic_stream = None
-                return None
-
-
-    def _reset_mic_stream(self):
-        with self._mic_lock:
-            if self._mic_stream is not None:
+    def _kill_arecord(self):
+        with self._arecord_lock:
+            if self._arecord_proc is not None:
                 try:
-                    self._mic_stream.stop_stream()
+                    self._arecord_proc.kill()
+                    self._arecord_proc.wait()
                 except Exception:
                     pass
-                try:
-                    self._mic_stream.close()
-                except Exception:
-                    pass
-            self._mic_stream = None
+                self._arecord_proc = None
 
 
 
-    #  Say response text
     def say(self, text: str):
         """System TTS z spd-say."""
         self.get_logger().info(f"{text}")
-
-        # Stop mic while speaking to avoid STT capturing TTS.
-        with self._mic_lock:
-            if self._mic_stream is not None:
-                try:
-                    self._mic_stream.stop_stream()
-                except Exception:
-                    pass
         try:
             subprocess.run(
                 ["spd-say", "-r", "-10", "-p", "-55", "-t", "male3", text],
@@ -278,7 +199,7 @@ class TaskNode(Node):
         except FileNotFoundError:
             print(f"spd-say not found. Would say: {text}")
         finally:
-            # Small cooldown to reduce echo pickup.
+            # Cooldown — arecord bo preskočil ta čas preden začne brati
             self._mic_suppressed_until = time.monotonic() + 0.6
 
 
@@ -340,28 +261,22 @@ class TaskNode(Node):
         return None
 
     def _listen_for_task_voice(self) -> str | None:
-        if self._sd is None or Model is None or KaldiRecognizer is None:
-            self.get_logger().error(
-                "Vosk ali pyaudio nista na voljo. Namesti: pip install vosk pyaudio\n"
-                "Padec nazaj na /task_input topic."
-            )
+        if Model is None or KaldiRecognizer is None:
+            self.get_logger().error("Vosk ni na voljo. Padec nazaj na /task_input topic.")
             return self._listen_for_task()
 
         if self._vosk_model is None:
             self.get_logger().error("Vosk model ni naložen. Voice STT disabled.")
             return None
 
-        SAMPLE_RATE   = 16000
-        CHUNK         = 4000    # ~0.25s blokov
-        SILENCE_SEC   = 2.0     # konec govora po toliko tišine
-        MAX_LISTEN_SEC = 15.0   # absolutni timeout
+        SAMPLE_RATE    = 16000
+        CHUNK_BYTES    = 8000   # 0.25s @ 16kHz 16-bit mono = 8000 bytes
+        SILENCE_SEC    = 2.0
+        MAX_LISTEN_SEC = 15.0
 
         recognizer = KaldiRecognizer(self._vosk_model, SAMPLE_RATE)
 
-        stream = self._get_mic_stream(SAMPLE_RATE, CHUNK)
-        if stream is None:
-            self.get_logger().error("Microphone stream not available. Falling back to /task_input.")
-            return self._listen_for_task()
+        cmd = ["arecord", "-f", "S16_LE", "-r", str(SAMPLE_RATE), "-c", "1", "-"]
 
         self.get_logger().info("🎤 Poslušam ... (govorite)")
         self._waiting_for_task = True
@@ -371,50 +286,52 @@ class TaskNode(Node):
         last_voice_time: float | None = None
 
         try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            with self._arecord_lock:
+                self._arecord_proc = proc
+
             try:
-                stream.start_stream()
-            except Exception:
-                pass
+                while rclpy.ok():
+                    now = time.monotonic()
 
-            while rclpy.ok():
-                now = time.monotonic()
+                    # Čakaj cooldown po TTS da ne posname robot samega sebe
+                    if now < self._mic_suppressed_until:
+                        time.sleep(0.05)
+                        continue
 
-                # If we just spoke, wait a moment before reading mic input.
-                if now < self._mic_suppressed_until:
-                    time.sleep(0.05)
-                    continue
+                    if now - listen_start > MAX_LISTEN_SEC:
+                        self.get_logger().warn("🎤 Timeout – prenehanje poslušanja.")
+                        break
 
-                # Absolutni timeout
-                if now - listen_start > MAX_LISTEN_SEC:
-                    self.get_logger().warn("🎤 Timeout – prenehanje poslušanja.")
-                    break
+                    data = proc.stdout.read(CHUNK_BYTES)
+                    if not data:
+                        break
 
-                try:
-                    data = stream.read(CHUNK, exception_on_overflow=False)
-                except Exception as exc:
-                    self.get_logger().error(f"Microphone read failed: {exc}")
-                    self._reset_mic_stream()
-                    return None
+                    if recognizer.AcceptWaveform(data):
+                        res = json.loads(recognizer.Result())
+                        text = res.get("text", "").strip()
+                        if text:
+                            self.get_logger().info(f"🎤 Zaznano: '{text}'")
+                            collected_text.append(text)
+                            last_voice_time = now
+                    else:
+                        partial = json.loads(recognizer.PartialResult()).get("partial", "")
+                        if partial:
+                            last_voice_time = now
 
-                if recognizer.AcceptWaveform(bytes(data)):
-                    # Celotna poved zaključena
-                    res = json.loads(recognizer.Result())
-                    text = res.get("text", "").strip()
-                    if text:
-                        self.get_logger().info(f"🎤 Zaznano: '{text}'")
-                        collected_text.append(text)
-                        last_voice_time = now
-                else:
-                    # Delni rezultat – zaznaj tišino
-                    partial = json.loads(recognizer.PartialResult()).get("partial", "")
-                    if partial:
-                        last_voice_time = now   # nekdo govori
+                    if collected_text and last_voice_time is not None and (now - last_voice_time) > SILENCE_SEC:
+                        self.get_logger().info("🎤 Tišina zaznana – končujem.")
+                        break
 
-                # Stop once we've heard something and then got enough silence.
-                if collected_text and last_voice_time is not None and (now - last_voice_time) > SILENCE_SEC:
-                    self.get_logger().info("🎤 Tišina zaznana – končujem.")
-                    break
+            finally:
+                proc.kill()
+                proc.wait()
+                with self._arecord_lock:
+                    self._arecord_proc = None
 
+        except FileNotFoundError:
+            self.get_logger().error("arecord ni nameščen. Padec nazaj na /task_input.")
+            return self._listen_for_task()
         finally:
             self._waiting_for_task = False
 
@@ -480,6 +397,7 @@ class TaskNode(Node):
         # Shrani
         with self._task_memory_lock:
             self.task_memory[name] = task
+            self.task_results[name] = self._empty_result(task)
 
         self.say(f"Understood. I will perform: {task}.")
 
@@ -499,6 +417,49 @@ class TaskNode(Node):
             if color:
                 self.color_of_the_cell_pub.publish(String(data=color))
 
+
+    # ── Rezultati ─────────────────────────────────────────────────────────────
+
+    def _empty_result(self, task: str) -> dict:
+        if task == "Counting rings":
+            return {"task": task, "total": 0, "by_color": {}}
+        if task == "Barrels inspection":
+            return {"task": task, "total": 0, "barrels": []}
+        if task == "Tile inspection":
+            return {"task": task, "total": 0, "tiles": []}
+        return {"task": task}
+
+    def set_rings_result(self, person: str, total: int, by_color: dict[str, int]) -> None:
+        """Nastavi rezultat za Counting rings.
+        by_color primer: {"red": 3, "blue": 2, "green": 1}
+        """
+        with self._task_memory_lock:
+            if person in self.task_results:
+                self.task_results[person].update({"total": total, "by_color": by_color})
+
+    def set_barrels_result(self, person: str, total: int, barrels: list[dict]) -> None:
+        """Nastavi rezultat za Barrels inspection.
+        barrels primer: [{"id": 1, "colour": "red", "orientation": "vertical", "leak": True}, ...]
+        """
+        with self._task_memory_lock:
+            if person in self.task_results:
+                self.task_results[person].update({"total": total, "barrels": barrels})
+
+    def set_tiles_result(self, person: str, total: int, tiles: list[dict]) -> None:
+        """Nastavi rezultat za Tile inspection.
+        tiles primer: [{"id": 1, "status": "OK"}, {"id": 2, "status": "NOK"}, ...]
+        """
+        with self._task_memory_lock:
+            if person in self.task_results:
+                self.task_results[person].update({"total": total, "tiles": tiles})
+
+    def _find_image(self, directory: str, obj_id) -> Path | None:
+        base = Path(directory) / str(obj_id)
+        for ext in (".jpg", ".jpeg", ".png"):
+            p = base.with_suffix(ext)
+            if p.exists():
+                return p
+        return None
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
     def _person_cb(self, msg: String):
@@ -560,51 +521,151 @@ class TaskNode(Node):
         self.say("Hello Sir, I am generating your report.")
         self._generate_tasks_pdf()
 
-    #generate pdf
     def _generate_tasks_pdf(self) -> Path | None:
-        """Generate a PDF with all stored names and tasks into ./pdf/ directory."""
-
+        """Generate a PDF report with tasks and results into ./pdf/ directory."""
         with self._task_memory_lock:
-            snapshot = dict(self.task_memory)
+            snapshot_tasks   = dict(self.task_memory)
+            snapshot_results = dict(self.task_results)
 
         out_dir = Path.cwd() / "pdf"
         out_dir.mkdir(parents=True, exist_ok=True)
-
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = out_dir / f"tasks_{timestamp}.pdf"
+        out_path  = out_dir / f"tasks_{timestamp}.pdf"
 
-        c = canvas.Canvas(str(out_path), pagesize=A4)
-        width, height = A4
+        styles = getSampleStyleSheet()
+        doc    = SimpleDocTemplate(str(out_path), pagesize=A4,
+                                   leftMargin=2*cm, rightMargin=2*cm,
+                                   topMargin=2*cm, bottomMargin=2*cm)
+        story  = []
 
-        left_margin = 50
-        top_margin = 50
-        y = height - top_margin
+        story.append(Paragraph("Tasks Report", styles["Title"]))
+        story.append(Paragraph(
+            f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+            styles["Normal"],
+        ))
+        story.append(Spacer(1, 0.5*cm))
 
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(left_margin, y, "Tasks summary")
-        y -= 24
-
-        c.setFont("Helvetica", 10)
-        c.drawString(left_margin, y, f"Generated: {datetime.now().isoformat(timespec='seconds')}")
-        y -= 20
-
-        if not snapshot:
-            c.drawString(left_margin, y, "No tasks recorded.")
-            c.save()
+        if not snapshot_tasks:
+            story.append(Paragraph("No tasks recorded.", styles["Normal"]))
+            doc.build(story)
             return out_path
 
-        for person_name in sorted(snapshot.keys(), key=lambda s: s.lower()):
-            task = snapshot.get(person_name, "")
-            line = f"{person_name}: {task}"
-            if y < 60:
-                c.showPage()
-                y = height - top_margin
-                c.setFont("Helvetica", 10)
-            c.drawString(left_margin, y, line)
-            y -= 14
+        for person_name in sorted(snapshot_tasks, key=str.lower):
+            task   = snapshot_tasks[person_name]
+            result = snapshot_results.get(person_name, {})
 
-        c.save()
+            story.append(Paragraph(person_name, styles["Heading1"]))
+            story.append(Paragraph(f"Task: <b>{task}</b>", styles["Normal"]))
+            story.append(Spacer(1, 0.3*cm))
+            story.extend(self._build_result_section(task, result))
+            story.append(Spacer(1, 0.8*cm))
+
+        doc.build(story)
         return out_path
+
+    def _build_result_section(self, task: str, result: dict) -> list:
+        styles  = getSampleStyleSheet()
+        section = []
+
+        _HDR_CMDS = [
+            ("BACKGROUND",    (0, 0), (-1, 0), rl_colors.HexColor("#2c3e50")),
+            ("TEXTCOLOR",     (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 0), (-1, -1), 9),
+            ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [rl_colors.white, rl_colors.HexColor("#f2f2f2")]),
+            ("GRID",          (0, 0), (-1, -1), 0.4, rl_colors.grey),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING",    (0, 0), (-1, -1), 5),
+        ]
+
+        if task == "Counting rings":
+            total    = result.get("total", 0)
+            by_color = result.get("by_color", {})
+            section.append(Paragraph(f"Total rings: <b>{total}</b>", styles["Normal"]))
+            if by_color:
+                section.append(Spacer(1, 0.2*cm))
+                data  = [["Color", "Count"]] + [[c, str(n)] for c, n in by_color.items()]
+                tbl   = Table(data, colWidths=[5*cm, 3*cm])
+                tbl.setStyle(TableStyle(_HDR_CMDS))
+                section.append(tbl)
+
+        elif task == "Barrels inspection":
+            total   = result.get("total", 0)
+            barrels = result.get("barrels", [])
+            section.append(Paragraph(f"Total detected: <b>{total}</b>", styles["Normal"]))
+
+            if barrels:
+                section.append(Spacer(1, 0.2*cm))
+                data = [["Barrel ID", "Colour", "Orientation", "Leak"]]
+                for b in barrels:
+                    data.append([
+                        str(b.get("id", "")),
+                        b.get("colour", ""),
+                        b.get("orientation", ""),
+                        "Yes" if b.get("leak") else "No",
+                    ])
+
+                style_cmds = list(_HDR_CMDS)
+                for i, b in enumerate(barrels, start=1):
+                    if b.get("leak"):
+                        style_cmds += [
+                            ("TEXTCOLOR", (3, i), (3, i), rl_colors.red),
+                            ("FONTNAME",  (3, i), (3, i), "Helvetica-Bold"),
+                        ]
+
+                tbl = Table(data, colWidths=[3*cm, 4*cm, 4*cm, 3*cm])
+                tbl.setStyle(TableStyle(style_cmds))
+                section.append(tbl)
+
+                # Slike za barrele z leak
+                for b in barrels:
+                    if b.get("leak"):
+                        img_path = self._find_image(self.barrels_img_dir, b["id"])
+                        if img_path:
+                            section.append(Spacer(1, 0.3*cm))
+                            section.append(Paragraph(
+                                f"Barrel {b['id']} — leak detected", styles["Italic"]
+                            ))
+                            section.append(RLImage(str(img_path), width=8*cm, height=6*cm))
+
+        elif task == "Tile inspection":
+            total = result.get("total", 0)
+            tiles = result.get("tiles", [])
+            section.append(Paragraph(f"Total tiles: <b>{total}</b>", styles["Normal"]))
+
+            if tiles:
+                section.append(Spacer(1, 0.2*cm))
+                data = [["Tile ID", "Status"]]
+                for t in tiles:
+                    data.append([str(t.get("id", "")), t.get("status", "")])
+
+                style_cmds = list(_HDR_CMDS)
+                for i, t in enumerate(tiles, start=1):
+                    if t.get("status") == "NOK":
+                        style_cmds += [
+                            ("TEXTCOLOR", (1, i), (1, i), rl_colors.red),
+                            ("FONTNAME",  (1, i), (1, i), "Helvetica-Bold"),
+                        ]
+
+                tbl = Table(data, colWidths=[4*cm, 4*cm])
+                tbl.setStyle(TableStyle(style_cmds))
+                section.append(tbl)
+
+                # Slike za NOK tiles
+                for t in tiles:
+                    if t.get("status") == "NOK":
+                        img_path = self._find_image(self.tiles_img_dir, t["id"])
+                        if img_path:
+                            section.append(Spacer(1, 0.3*cm))
+                            section.append(Paragraph(
+                                f"Tile {t['id']} — NOK", styles["Italic"]
+                            ))
+                            section.append(RLImage(str(img_path), width=8*cm, height=6*cm))
+
+        return section
 
 
 def main(args=None):
