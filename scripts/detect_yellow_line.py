@@ -29,9 +29,9 @@ class YellowLineDetector(Node):
         self.declare_parameter("v_high", 255)
 
         # "Ahead" window in ROI (center-bottom region)
-        self.declare_parameter("ahead_window_x_min_ratio", 0.35)
-        self.declare_parameter("ahead_window_x_max_ratio", 0.65)
-        self.declare_parameter("ahead_window_y_min_ratio", 0.35)
+        self.declare_parameter("ahead_window_x_min_ratio", 0.45)
+        self.declare_parameter("ahead_window_x_max_ratio", 0.55)
+        self.declare_parameter("ahead_window_y_min_ratio", 0.1)
         self.declare_parameter("ahead_pixel_ratio_threshold", 0.04)
 
         image_topic = self.get_parameter("image_topic").value
