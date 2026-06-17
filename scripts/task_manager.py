@@ -357,7 +357,6 @@ class TaskNode(Node):
         MAX_LISTEN_SEC = 15.0   # absolutni timeout
 
         recognizer = KaldiRecognizer(self._vosk_model, SAMPLE_RATE)
-        recognizer.SetGrammar(self._vosk_grammar)
 
         stream = self._get_mic_stream(SAMPLE_RATE, CHUNK)
         if stream is None:
@@ -397,7 +396,7 @@ class TaskNode(Node):
                     self._reset_mic_stream()
                     return None
 
-                if recognizer.AcceptWaveform(data):
+                if recognizer.AcceptWaveform(bytes(data)):
                     # Celotna poved zaključena
                     res = json.loads(recognizer.Result())
                     text = res.get("text", "").strip()
