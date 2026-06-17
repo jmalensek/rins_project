@@ -24,7 +24,6 @@ Zamenjava za mikrofon: samo funkcijo _listen_for_task() zamenjamo z STT klicem.
 #   ros2 topic pub --once /task_input std_msgs/msg/String "{data: 'Detect anomalies in the green cell'}"
 
 from datetime import datetime
-from difflib import SequenceMatcher
 import json
 import os
 from pathlib import Path
@@ -34,6 +33,11 @@ import threading
 import time
 
 import json as _json
+
+try:
+    from rapidfuzz import fuzz as _fuzz  # type: ignore[import-not-found]
+except Exception:
+    _fuzz = None  # type: ignore[assignment]
 
 try:
     import sounddevice as sd  # type: ignore[import-not-found]
@@ -56,125 +60,61 @@ from reportlab.pdfgen import canvas
 
 
 TASK_KEYWORDS = {
-    "Barrels inspection":       ["barrel", "barrels", "cylinder", "cylinders", "battles"],
-    "Counting rings":         ["ring",   "rings",   "count rings", "circles"],
-    "Anomaly detection":         ["tiles", "anomaly", "cell", "anomalies"],
+    "Barrels inspection": ["barrel", "barrels", "cylinder", "cylinders", "battles"],
+    "Counting rings":     ["ring", "rings", "count rings", "circles"],
+    "Tile inspection":    ["tile", "tiles", "cell", "anomaly", "anomalies", "inspect"],
 }
 MIN_TASK_SCORE = 0.45
 
 GRAMMAR = _json.dumps([
     # Barrels
-    "barrels", "barrel", "inspection", "barrel inspection",
-    # Rings  
-    "rings", "ring", "count rings", "count the rings",
-    # Anomaly
-    "anomaly", "anomaly red", "anomaly green",
+    "barrel", "barrels", "cylinder", "cylinders", "inspection", "barrel inspection",
+    # Rings
+    "ring", "rings", "count rings", "count the rings",
+    # Tile inspection
+    "tile", "tiles", "cell", "anomaly", "anomalies",
+    # Colors (for tile inspection follow-up)
     "red", "red cell", "green", "green cell",
-    # Nothing
-    "nothing", "none",
-    # Confirmation (za ženski dialog)
+    # Confirmation
     "yes", "i am sure", "sure", "correct",
     # Fallback
-    "[unk]"
+    "nothing", "none", "[unk]"
 ])
 
 
-def _tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-z]+", text.lower())
-
-# similar sounding words to TASK_KEYWORDS
-def _soundex(word: str) -> str:
-    """Simple English-oriented Soundex (good enough for STT typos)."""
-    w = re.sub(r"[^A-Za-z]", "", word)
-    if not w:
-        return ""
-    w = w.upper()
-    first = w[0]
-    mapping = {
-        "B": "1", "F": "1", "P": "1", "V": "1",
-        "C": "2", "G": "2", "J": "2", "K": "2", "Q": "2", "S": "2", "X": "2", "Z": "2",
-        "D": "3", "T": "3",
-        "L": "4",
-        "M": "5", "N": "5",
-        "R": "6",
-    }
-
-    digits: list[str] = []
-    last = ""
-    for ch in w[1:]:
-        d = mapping.get(ch, "")
-        if d == last:
-            continue
-        last = d
-        if d:
-            digits.append(d)
-
-    code = (first + "".join(digits) + "000")[:4]
-    return code
-
-
-_TASK_PHONETIC: dict[str, set[str]] = {
-    task: {_soundex(tok) for kw in keywords for tok in _tokenize(kw) if _soundex(tok)}
-    for task, keywords in TASK_KEYWORDS.items()
-}
-
-
-def classify_task(raw: str) -> tuple[str, float]:
-    """Return (task, confidence_score in [0..1])."""
+def classify_task(raw: str) -> tuple[str | None, float]:
+    """Return (task, confidence_score in [0..1]) using rapidfuzz token matching."""
     text = raw.strip().lower()
-    tokens = _tokenize(text)
+    tokens = re.findall(r"[a-z]+", text)
 
     if not text:
-        # Nothing to classify
-        return (next(iter(TASK_KEYWORDS)), 0.0)
+        return (None, 0.0)
 
-    # Exact keyword substring match => high confidence
+    # Exact keyword substring match => confidence 1.0
     for task, keywords in TASK_KEYWORDS.items():
         for kw in keywords:
             if kw in text:
                 return (task, 1.0)
 
-    # Phonetic/fuzzy token match => medium-high confidence
-    if tokens:
-        token_soundex = {_soundex(t) for t in tokens if _soundex(t)}
-        for task, keywords in TASK_KEYWORDS.items():
-            if token_soundex and (token_soundex & _TASK_PHONETIC.get(task, set())):
-                return (task, 0.9)
-
-            for kw in keywords:
-                for kw_tok in _tokenize(kw):
-                    for t in tokens:
-                        if SequenceMatcher(None, t, kw_tok).ratio() >= 0.84:
-                            return (task, 0.85)
-
-    # Soft fallback: score all tasks
-    best_task: str | None = None
-    best_score = 0.0
-
+    # Fuzzy token match with rapidfuzz (or fallback to simple ratio without it)
+    scores: dict[str, float] = {}
     for task, keywords in TASK_KEYWORDS.items():
-        score = 0.0
-
-        for kw in keywords:
-            score = max(score, SequenceMatcher(None, text, kw.lower()).ratio())
-
-        if tokens:
+        best = 0.0
+        for tok in tokens:
             for kw in keywords:
-                kw_tokens = _tokenize(kw)
-                for t in tokens:
-                    for kw_tok in kw_tokens:
-                        score = max(score, SequenceMatcher(None, t, kw_tok).ratio())
+                kw_tokens = re.findall(r"[a-z]+", kw)
+                for kw_tok in kw_tokens:
+                    if _fuzz is not None:
+                        ratio = _fuzz.ratio(tok, kw_tok) / 100.0
+                    else:
+                        # simple overlap fallback if rapidfuzz not installed
+                        common = sum((tok.count(c) for c in set(kw_tok)))
+                        ratio = 2 * common / (len(tok) + len(kw_tok)) if (tok and kw_tok) else 0.0
+                    best = max(best, ratio)
+        scores[task] = best
 
-        if best_task is None or score > best_score:
-            best_score = score
-            best_task = task
-
-    return (best_task or next(iter(TASK_KEYWORDS))), best_score
-
-
-
-def normalize_task(raw: str) -> str:
-    task, _score = classify_task(raw)
-    return task
+    best_task = max(scores, key=scores.get)
+    return best_task, scores[best_task]
 
 
 class TaskNode(Node):
@@ -342,9 +282,11 @@ class TaskNode(Node):
             self._mic_suppressed_until = time.monotonic() + 0.6
 
 
-    def _listen_for_categorized_task(self) -> str | None:
-        """Listen until we can confidently categorize into TASK_KEYWORDS."""
-        while rclpy.ok():
+    def _listen_for_categorized_task(self) -> tuple[str, str] | None:
+        """Listen until we can confidently categorize into TASK_KEYWORDS.
+        Returns (task, raw_text) or None on failure."""
+        MAX_ATTEMPTS = 3
+        for attempt in range(MAX_ATTEMPTS):
             raw = self._listen_for_task_voice()
             if raw is None:
                 return None
@@ -352,12 +294,14 @@ class TaskNode(Node):
             task, score = classify_task(raw)
             self.get_logger().info(f"Task classification score={score:.2f} -> {task}")
 
-            if score >= MIN_TASK_SCORE:
-                return task
+            if score >= MIN_TASK_SCORE and task is not None:
+                return (task, raw)
 
-            self.say("I didn't catch that, can you please repeat?")
-            time.sleep(2)
+            if attempt < MAX_ATTEMPTS - 1:
+                self.say("I didn't catch that, can you please repeat?")
+                time.sleep(2)
 
+        self.say("I'm sorry, I could not understand the task.")
         return None
 
 
@@ -387,8 +331,16 @@ class TaskNode(Node):
         return result
 
 
+    def _extract_color(self, text: str) -> str | None:
+        t = text.lower()
+        if "red" in t:
+            return "red"
+        if "green" in t:
+            return "green"
+        return None
+
     def _listen_for_task_voice(self) -> str | None:
-        if pyaudio is None or Model is None or KaldiRecognizer is None:
+        if self._sd is None or Model is None or KaldiRecognizer is None:
             self.get_logger().error(
                 "Vosk ali pyaudio nista na voljo. Namesti: pip install vosk pyaudio\n"
                 "Padec nazaj na /task_input topic."
@@ -493,13 +445,13 @@ class TaskNode(Node):
         time.sleep(3)
 
         # Poslušaj odgovor
-        task = self._listen_for_categorized_task()
-        if task is None:
+        result = self._listen_for_categorized_task()
+        if result is None:
             self.get_logger().warn(f"No task received for {name}.")
             return
+        task, raw_text = result
 
         self.get_logger().info(f"Task: {task}")
-
 
         # If female ASK AGAIN until she says yes
         if gender == "female":
@@ -511,19 +463,18 @@ class TaskNode(Node):
                 if raw is None:
                     self.get_logger().warn(f"No task received for {name}.")
                     return
-                self.get_logger().info(f"Received: '{raw}')")
+                self.get_logger().info(f"Received: '{raw}'")
 
                 if "yes" in raw.lower() or "i am sure" in raw.lower():
-                    # se je odločila
                     undecided = False
                 else:
                     new_task, score = classify_task(raw)
-                    if score < MIN_TASK_SCORE:
+                    if score < MIN_TASK_SCORE or new_task is None:
                         self.say("I didn't catch that, can you please repeat?")
                         time.sleep(0.2)
                         continue
                     task = new_task
-
+                    raw_text = raw
 
         self.get_logger().info(f"Task for {name}: {task}")
 
@@ -531,28 +482,23 @@ class TaskNode(Node):
         with self._task_memory_lock:
             self.task_memory[name] = task
 
-        # Potrditev
-        spoken_task = task if task in TASK_KEYWORDS else normalize_task(task)
-        self.say(f"Understood. I will perform: {spoken_task}.")
+        self.say(f"Understood. I will perform: {task}.")
 
-        if spoken_task == "Anomaly detection":
+        if task == "Tile inspection":
+            # Try to extract color from the utterance; ask if missing
+            color = self._extract_color(raw_text)
+            if color is None:
+                self.say("Which cell should I inspect, red or green?")
+                time.sleep(1)
+                color_raw = self._listen_for_task_voice()
+                if color_raw:
+                    color = self._extract_color(color_raw)
+
+            self.color_of_the_cell = color
+            self.get_logger().info(f"Cell color: {color}")
             self.start_task_anomaly_pub.publish(Bool(data=True))
-
-
-        '''
-        TREBA DODAT DA BO ŠE PUBLISHAL BARVO
-        
-            if self.color_of_the_cell == 'green':
-                self.color_of_the_cell_pub.publish(String(data='green'))
-            elif self.color_of_the_cell == 'red':
-                self.color_of_the_cell_pub.publish(String(data='red'))
-        
-        '''
-
-        if name.strip().lower() == "jeff":
-            pdf_path = self._generate_tasks_pdf()
-            if pdf_path is not None:
-                self.get_logger().info(f"Generated PDF: {pdf_path}")
+            if color:
+                self.color_of_the_cell_pub.publish(String(data=color))
 
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
