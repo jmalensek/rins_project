@@ -20,6 +20,8 @@ import subprocess
 from tf2_ros import TransformListener, Buffer, TransformException
 from tf2_geometry_msgs import do_transform_point
 
+from rins_interfaces.msg import RingsResults
+
 
 class detect_rings(Node):
 
@@ -47,6 +49,8 @@ class detect_rings(Node):
 
         self.rgb_image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.rgb_callback, qos_profile_sensor_data)
         self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
+
+        self.report_ring_pub = self.create_publisher(RingsResults, "/rings_results rins_interfaces/msg/RingsResults", 10)
 
         self.marker_pub = self.create_publisher(Marker, marker_topic, QoSReliabilityPolicy.RELIABLE)
 
@@ -500,8 +504,21 @@ class detect_rings(Node):
         if len(self.detected_rings) == 0:
 
             self.get_logger().info("No rings stored.")
+            
+            # Publish empty message
+            msg = RingsResults()
+            msg.total = 0
+            msg.barve = []
+            msg.stevila = []
+            self.report_ring_pub.publish(msg)
 
             return
+        
+        # Count rings by color
+        color_counts = {}
+        for ring in self.detected_rings:
+            color = ring["color"]
+            color_counts[color] = color_counts.get(color, 0) + 1
 
         for ring in self.detected_rings:
 
@@ -518,7 +535,17 @@ class detect_rings(Node):
                 f"x={pos['x']:.3f}, "
                 f"y={pos['y']:.3f}, "
                 f"z={pos['z']:.3f}"
-            )           
+            )
+        
+        # Compose and publish RingsResults message
+        msg = RingsResults()
+        msg.total = len(self.detected_rings)
+        msg.barve = list(color_counts.keys())
+        msg.stevila = list(color_counts.values())
+        
+        self.report_ring_pub.publish(msg)
+        self.get_logger().info(f"Published RingsResults: total={msg.total}, colors={msg.barve}, counts={msg.stevila}")
+           
 
 def main():
     print('Ring detection node starting.')
@@ -541,3 +568,11 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+'''
+int32 total
+string[] barve
+int32[] stevila
+'''
