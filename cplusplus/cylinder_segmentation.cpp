@@ -18,6 +18,7 @@
 #include "sensor_msgs/msg/camera_info.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "sensor_msgs/msg/image.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "tf2/convert.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
@@ -233,6 +234,21 @@ static void printSavedCylindersReport() {
         }
         std::cout << "]\n";
     }
+}
+
+
+void finished_callback(const std_msgs::msg::Bool::SharedPtr msg) {
+    if (!msg->data) {
+        return;
+    }
+
+    std::cout << "Finished signal received; printing report and shutting down." << std::endl;
+    printSavedCylindersReport();
+
+    if (node) {
+        node.reset();
+    }
+    rclcpp::shutdown();
 }
 
 
@@ -980,6 +996,9 @@ int main(int argc, char** argv) {
     viz_image_pub = node->create_publisher<sensor_msgs::msg::Image>("cylinder_viz_image", 1);  // NEW
     barrels_results_pub = node->create_publisher<rins_interfaces::msg::BarrelsResults>("barrels_results", 10);
 
+    // finished signal subscriber
+    auto finished_sub = node->create_subscription<std_msgs::msg::Bool>(
+        "/finished", 10, finished_callback);
 
     rclcpp::spin(node);
     rclcpp::shutdown();

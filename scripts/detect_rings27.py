@@ -21,6 +21,8 @@ from tf2_ros import TransformListener, Buffer, TransformException
 from tf2_geometry_msgs import do_transform_point
 
 from rins_interfaces.msg import RingsResults
+from std_msgs.msg import Bool
+
 
 
 class detect_rings(Node):
@@ -49,6 +51,7 @@ class detect_rings(Node):
 
         self.rgb_image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.rgb_callback, qos_profile_sensor_data)
         self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
+        self.finished_sub = self.create_subscription(Bool, "/finished", self.finished_callback, 10)
 
         self.report_ring_pub = self.create_publisher(RingsResults, "/rings_results", 10)
 
@@ -545,7 +548,20 @@ class detect_rings(Node):
         
         self.report_ring_pub.publish(msg)
         self.get_logger().info(f"Published RingsResults: total={msg.total}, colors={msg.barve}, counts={msg.stevila}")
-           
+
+    def finished_callback(self, msg: Bool):
+        if msg.data:
+            self.get_logger().info('Finished signal received; printing results and shutting down node.')
+            self.print_detected_rings()
+            try:
+                self.destroy_node()
+            except Exception as e:
+                self.get_logger().error(f'Error destroying node: {e}')
+            try:
+                rclpy.shutdown()
+            except Exception as e:
+                self.get_logger().error(f'Error during rclpy shutdown: {e}')
+
 
 def main():
     print('Ring detection node starting.')
