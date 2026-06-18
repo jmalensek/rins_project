@@ -12,7 +12,7 @@ from collections import deque
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, Quaternion
-from nav2_msgs.srv import ComputePathToPose
+from nav2_msgs.action import ComputePathToPose
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import TwistStamped
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -143,10 +143,12 @@ class RobotExplorer(Node):
         # Publisher for visualizing a grid of markers on RViz
         self.pub_grid_marker = self.create_publisher(Marker, "/visual_grid", 10)
 
-        self.compute_path_client = self.create_client(ComputePathToPose, '/compute_path_to_pose')
+        # Change from create_client to ActionClient
+        self.compute_path_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
 
-        while not self.compute_path_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info("Waiting for ComputePathToPose service...")
+        # Actions use wait_for_server(), not wait_for_service()
+        while not self.compute_path_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().info("Waiting for ComputePathToPose action server...")
 
         # Initialisation successful
         self.get_logger().info(f"Robot explorer has been initialized!")
@@ -726,6 +728,9 @@ class RobotExplorer(Node):
                 self.get_logger().warn("No reachable unvisited waypoints remaining.")
                 break
 
+            # Print status info
+            self.get_logger().info(f"Current point: ({x:.2f}, {y:.2f}), Next point: ({next_point[0]:.2f}, {next_point[1]:.2f}), Cost: {best_cost:.2f}, Unvisited waypoints remaining: {len(unvisited_waypoints)}")
+
             current_point = next_point
 
     # Sequentially visits a set of waypoints on a provided map
@@ -1041,10 +1046,12 @@ class RobotExplorer(Node):
         return math.sqrt(target_x ** 2 + target_y ** 2)
     
     # Computes the length of a path between to points
-    def path_length(self, path: ComputePathToPose.Response) -> float:
+    # Computes the length of a path between two points
+    def path_length(self, path: ComputePathToPose.Result) -> float:
         total = 0.0
 
-        poses = path.poses
+        # Nav2 action results pack the Path inside a field called .path
+        poses = path.path.poses
 
         for i in range(1, len(poses)):
             p1 = poses[i - 1].pose.position
@@ -1069,23 +1076,35 @@ class RobotExplorer(Node):
         goal.pose.position.y = goal_xy[1]
         goal.pose.orientation.w = 1.0
 
-        req = ComputePathToPose.Request()
+        # Actions use .Goal(), not .Request()
+        req = ComputePathToPose.Goal()
         req.start = start
         req.goal = goal
 
-        future = self.compute_path_client.call_async(req)
-
+        # Assuming self.compute_path_client is an ActionClient:
+        future = self.compute_path_client.send_goal_async(req)
         rclpy.spin_until_future_complete(self, future)
-
-        result = future.result()
-
-        if result is None:
+        
+        goal_handle = future.result()
+        if not goal_handle or not goal_handle.accepted:
             return None
 
-        if len(result.path.poses) == 0:
+        # Get the actual result from the action goal handle
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future)
+        
+        action_result = result_future.result()
+        
+        # action_result.result contains the actual ComputePathToPose.Result
+        if action_result is None or not action_result.result:
             return None
 
-        return self.path_length(result.path)
+        # Check if the generated path has poses
+        if len(action_result.result.path.poses) == 0:
+            return None
+
+        # Pass the full result block to your updated path_length function
+        return self.path_length(action_result.result)
 
     # Get the robot's current position
     def get_current_position_amcl(self) -> tuple[float, float]:
@@ -1503,7 +1522,7 @@ def main(args = None):
                     (-2.9796109425001718, -1.0694166887545653),
                     (-3.26013179610062, -1.1159374308024788)]
 
-    waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=0.8)
+    waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=1.0)
     re.publish_grid_markers(waypoints_task2_sim_area1)
     print(f"Generated {len(waypoints_task2_sim_area1)} waypoints for area 1")
 
@@ -1514,7 +1533,7 @@ def main(args = None):
     # TASK 2
     # For line detection run detect_yellow_line.py and arm_mover_actions.py
     # For best view of both the yellow and blue line
-    re.cover_waypoints_area1_basic(waypoints_task2_sim_area1, localise=False)
+    re.cover_waypoints_area1_optimized(waypoints_task2_sim_area1, localise=False)
 
     #re.cover_waypoints_basic(waypoints_task2_sim_area1, localise=False)
 
