@@ -26,6 +26,8 @@ import numpy as np
 # Uvoz tvojega RobotCommanderja iz iste mape/paketa
 from robot_commander import RobotCommander 
 
+from robot_explorer import RobotExplorer
+
 
 class RedGreenCellDetection(Node):
     def __init__(self):
@@ -40,12 +42,12 @@ class RedGreenCellDetection(Node):
         # Nastavi dejanske končne in začetne koordinatne točke za tvoje okolje
         self.COORDINATES = {
             'cell 1': {
-                'start': (-1.57, -4.8, 0.0),
-                'end': (0.59, -4.8, 0.0)
+                'start': (-1.57, -4.8),
+                'end': (0.59, -4.8)
             },
             'cell 2': {
-                'start': (-4.76, 0.343, 0.0),
-                'end': (-4.76, -2.749, 0.0)
+                'start': (-4.76, 0.343),
+                'end': (-4.76, -2.749)
             }
         }
 
@@ -66,6 +68,8 @@ class RedGreenCellDetection(Node):
 
         # Inicializacija Robot Commanderja
         self.commander = RobotCommander(self)
+
+        self.explo = RobotExplorer(self)
 
         # Interno stanje
         self.task_active = False
@@ -143,8 +147,13 @@ class RedGreenCellDetection(Node):
                 # 1. Premik do začetne točke celice
                 self.get_logger().info(f"Potujem proti ZAČETKU celice: {start_coords}")
                 # go_to_pose interno čaka na uspeh/konec premika (blokirajoč klic)
-                self.commander.go_to_pose(start_coords[0], start_coords[1], start_coords[2])
-            
+
+                ayaw = self.explo.compute_absolute_yaw(start_coords, end_coords)
+
+                self.explo.go_to_pose(start_coords[0], start_coords[1], ayaw)
+
+                distance = self.explo.compute_distance(start_coords, end_coords)
+
                 # Počakamo sekundo, da se robot povsem umiri pred analizo slike
                 time.sleep(1.0)
 
@@ -156,10 +165,12 @@ class RedGreenCellDetection(Node):
                     # Priprava senzorjev in roke
                     self.raise_top_camera()
                     self.start_tile_detection()
+
                     
                     # 3. Premik do končne točke celice
                     self.get_logger().info(f"Potujem proti KONCU celice: {end_coords}")
-                    self.commander.go_to_pose(end_coords[0], end_coords[1], end_coords[2])
+                    #self.commander.go_to_pose(end_coords[0], end_coords[1], end_coords[2])
+                    self.explo.move_straight_odom(distance=distance)
                     
                     # Zaključek misije
                     self.get_logger().info("Prispeli na konec celice. Zaustavljam detekcijo ploščic.")
