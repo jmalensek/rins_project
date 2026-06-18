@@ -656,7 +656,14 @@ class RobotExplorer(Node):
                     break
 
     # Visits points in area1 of task 2 by computing the cost to each unvisited point and moving to the closest one, while avoiding obstacles and the yellow line
-    def cover_waypoints_area1_optimized(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, sidestep_distance: float = 0.3, wait_time: float = 1.0, localise: bool = True) -> None:
+    def cover_waypoints_area1_optimized(self, waypoints: list[tuple[float, float]], 
+                                        turns: int = 4, 
+                                        angular_speed: float = 0.5, 
+                                        sidestep_distance: float = 0.3, 
+                                        wait_time: float = 1.0,
+                                        point_timeout_sec: float = 15.0,
+                                        localise: bool = True
+                                        ) -> None:
         
         current_point = waypoints[0]  
         unvisited_waypoints = waypoints.copy()
@@ -680,8 +687,23 @@ class RobotExplorer(Node):
                 self.get_logger().error(f"Failed to send goal to ({x:.2f}, {y:.2f})")
                 continue
             
+            point_start_time = self.get_clock().now()
             while rclpy.ok():
                 rclpy.spin_once(self, timeout_sec=0.0)
+
+                # Time check for the current point to avoid getting stuck on unreachable points
+                elapsed_time = (self.get_clock().now() - point_start_time).nanoseconds / 1e9
+                if elapsed_time > point_timeout_sec:
+                    self.get_logger().warn(f"Target ({x:.2f}, {y:.2f}) timed out after {elapsed_time:.1f}s. Skipping to next point!")
+                    
+                    # Safely cancel the goal if the handle is active
+                    if self.goal_handle is not None:
+                        cancel_future = self.goal_handle.cancel_goal_async()
+                        rclpy.spin_until_future_complete(self, cancel_future)
+                    
+                    # Remove from unvisited list so we skip it entirely
+                    unvisited_waypoints.remove(current_point)
+                    break
 
                 # If a yellow line is detected ahead while moving, cancel the current goal
                 #if self.yellow_ahead and self.is_moving():                
