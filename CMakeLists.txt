@@ -28,6 +28,8 @@ find_package(sensor_msgs REQUIRED)
 find_package(message_filters REQUIRED)
 find_package(cv_bridge REQUIRED)
 
+find_package(rins_interfaces REQUIRED)
+
 find_package(OpenCV REQUIRED)
 
 find_package(pcl_conversions REQUIRED)
@@ -41,6 +43,9 @@ set(dependencies rclcpp std_msgs std_srvs geometry_msgs sensor_msgs visualizatio
 add_executable(cylinder_segmentation cplusplus/cylinder_segmentation.cpp)
 ament_target_dependencies(cylinder_segmentation ${dependencies})
 
+ament_target_dependencies(cylinder_segmentation
+  rins_interfaces
+)
 
 target_link_libraries(cylinder_segmentation
   ${Boost_SYSTEM_LIBRARY}
