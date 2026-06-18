@@ -1629,8 +1629,8 @@ def main(args = None):
     #re.localise_self()
 
     # hardcoded waypoints for the specific map
-    area1_lower_bound = (-4.625164799871704, 0.3657965954308261)
-    area1_upper_bound = (0.5791560549165018, -5.072113041813735)
+    area1_lower_bound = (-4.560337785930067, 0.3095074895367979)
+    area1_upper_bound = (0.8546432926447738, -4.779675645286376)
     blue_line_start = (2.797641390882936, 0.19569027139125528)
 
     blue_line_start_quaternion_yaw = re.quaternion_to_yaw(Quaternion(x=-0.0, y=0.0, z=0.707, w=0.707))
@@ -1680,6 +1680,9 @@ def main(args = None):
     waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=1.0)
     re.publish_grid_markers(waypoints_task2_sim_area1)
     print(f"Generated {len(waypoints_task2_sim_area1)} waypoints for area 1")
+
+    while rclpy.ok():
+        time.sleep(1.0)
 
     # Turn right
     #re.turn_odom(-math.pi/2, angular_speed=0.5)
