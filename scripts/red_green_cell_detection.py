@@ -18,6 +18,14 @@ extenda kamero - arm_mover - desno zgoraj
 - pošlje signal tile_detection, da lahko začne z delom
 
 - se počasi premakne proti drugemu koncu, ko ne vidi več zelene/rdeče linije, konča - pošlje signal tile detection, da je konec
+
+
+
+NOVO:
+ko pride robotek do koordinat, se samo preveri katera barva je, pa se pošilja nav goal za 0.5 v x/y smer (v minus). 
+Vsakič znova se potem preveri, ali je ta barva še v vidnem polju (roi, leva polovica). Potem ko ni več vidna, se robotek 
+zarotira za 180 stopinj, in potem nadaljuje z nav goal za 0.5 v x/y smer (v plus). vsakič preveri ali je barva še vidna v roi 
+na desni strani. ko ni več, je konec
 '''
 
 import math
@@ -50,11 +58,10 @@ from action_msgs.msg import GoalStatus
 class CellState(Enum):
     IDLE = auto()
     MOVING_TO_CELL = auto()
-    ALIGNING = auto()
-    FOLLOWING_TO_FAR_END = auto()
+    FIRST_PASS_STEPPING = auto()
     TURNING_180 = auto()
+    RETURN_PASS_STEPPING = auto()
     PREPARING_TILE_DETECTION = auto()
-    FOLLOWING_BACK = auto()
     DONE = auto()
 
 
@@ -82,6 +89,7 @@ class RedGreenCellDetection(Node):
                 ('turn_180_angular_speed', 0.4),
                 # kot (v stopinjah) znotraj katerega štejemo linijo za "poravnano" (navpično)
                 ('alignment_tolerance_deg', 6.0),
+                ('last_goal', )
             ],
         )
 
@@ -117,11 +125,13 @@ class RedGreenCellDetection(Node):
 
         # state machine
         self.state = CellState.IDLE
-        self._turn_start_time = None
-        self._turn_target_duration = None
-
-        # števec framov, v katerih aktivna linija ni bila vidna
+        
+        # step-and-check state tracking
+        self._current_goal_x: float | None = None
+        self._current_goal_y: float | None = None
+        self._step_size = 0.5  # meters
         self._frames_without_line = 0
+        self._line_lost_threshold = 10
 
         # zadnji prejeti pointcloud (organiziran, height x width kot kamera slika)
         # in zacasno shranjeni pixel centroidi, ki cakajo na uskladitev s
@@ -634,21 +644,23 @@ class RedGreenCellDetection(Node):
         self.navigation_goal_active = False
 
         result = future.result()
-
         status = result.status
 
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info(
-                'Navigation succeeded'
-            )
-
-            self.state = CellState.ALIGNING
-
+            self.get_logger().info('Navigation step succeeded')
+            # Transition from MOVING_TO_CELL -> FIRST_PASS_STEPPING
+            if self.state == CellState.MOVING_TO_CELL:
+                self.get_logger().info('Reached initial cell area. State -> FIRST_PASS_STEPPING')
+                self.state = CellState.FIRST_PASS_STEPPING
+                # Initialize goal coordinates from target cell
+                if self.red_cell_coord:
+                    self._current_goal_x = self.red_cell_coord[0]
+                    self._current_goal_y = self.red_cell_coord[1]
+                elif self.green_cell_coord:
+                    self._current_goal_x = self.green_cell_coord[0]
+                    self._current_goal_y = self.green_cell_coord[1]
         else:
-            self.get_logger().error(
-                f'Navigation failed with status {status}'
-            )
-
+            self.get_logger().error(f'Navigation failed with status {status}')
             self.state = CellState.IDLE
     def camera_callback(self, msg: Image):
         """Handle incoming camera frames."""
@@ -740,7 +752,7 @@ class RedGreenCellDetection(Node):
     # ------------------------------------------------------------------
 
     def begin_cell_approach(self):
-        """Sproži celoten manever: premik do celice, poravnava, sledenje, itd."""
+        """Sproži celoten manever: premik do celice, nato step-and-check."""
         if self.state != CellState.IDLE:
             self.get_logger().warning('Approach already in progress, ignoring duplicate trigger.')
             return
@@ -748,6 +760,8 @@ class RedGreenCellDetection(Node):
         self.state = CellState.MOVING_TO_CELL
         self.send_navigation_goal()
         self.get_logger().info('State -> MOVING_TO_CELL')
+        self._current_goal_x = None
+        self._current_goal_y = None
 
     def step_state_machine(self, image: np.ndarray):
         if self.state == CellState.IDLE or self.state == CellState.DONE:
@@ -759,156 +773,132 @@ class RedGreenCellDetection(Node):
             return
 
         if self.state == CellState.MOVING_TO_CELL:
+            # Čakamo, da Nav2 doseže ciljno lokacijo, nato preide v prvi prehod
             return
-        elif self.state == CellState.ALIGNING:
-            self._do_aligning(image, color)
-        elif self.state == CellState.FOLLOWING_TO_FAR_END:
-            self._do_following(image, color, next_state=CellState.TURNING_180)
+        elif self.state == CellState.FIRST_PASS_STEPPING:
+            self._do_first_pass_step(image, color)
         elif self.state == CellState.TURNING_180:
-            self._do_turning_180()
+            self._do_turn_180(image, color)
+        elif self.state == CellState.RETURN_PASS_STEPPING:
+            self._do_return_pass_step(image, color)
         elif self.state == CellState.PREPARING_TILE_DETECTION:
             self._do_preparing_tile_detection()
-        elif self.state == CellState.FOLLOWING_BACK:
-            self._do_following(image, color, next_state=CellState.DONE)
 
-    def _publish_cmd(self, linear_x: float, angular_z: float):
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
-        msg.twist.linear.x = linear_x
-        msg.twist.angular.z = angular_z
-        self.cmd_vel_pub.publish(msg)
+    def _color_direction(self, color: str) -> tuple[str, str]:
+        """Vrne smer premika za dano barvo. Red = y, Green = x. Vrne ('x'/'y', 'pos'/'neg')."""
+        if color == 'red':
+            return ('y', 'neg')  # Horizontalna črta -> y gibanje
+        else:  # green
+            return ('x', 'neg')  # Vertikalna črta -> x gibanje
 
-    def _stop(self):
-        self._publish_cmd(0.0, 0.0)
-
-    def _do_moving_to_cell(self, image: np.ndarray, color: str):
-        """
-        Premik naprej, dokler ne zaznamo aktivne barvne linije neposredno pred/pod
-        robotom (v spodnjem ROI-ju). To nadomešča potrebo po metričnih
-        koordinatah - dokler nimamo pointcloud_callback z dejansko 3D pozicijo
-        celice, se približujemo vizualno.
-        """
+    def _line_visible_in_roi_half(self, image: np.ndarray, color: str, side: str) -> bool:
+        """Preveri, ali je črta vidna v izbrani polovici ROI. side='left' ali 'right'."""
         result = self.detect_color_for_navigation(image, color)
-
         if result is None:
-            self._publish_cmd(self.approach_linear_speed, 0.0)
+            return False
+        
+        cx = result['center'][0]
+        w = image.shape[1]
+        
+        if side == 'left':
+            return cx < w / 2.0
+        else:  # 'right'
+            return cx >= w / 2.0
+
+    def _send_step_goal(self, x: float, y: float, yaw: float = 0.0):
+        """Pošlje Nav2 cilj na podanih svetovalnih koordinatah z dano yaw orientacijo."""
+        if not self.nav_to_pose_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().error('NavigateToPose action server not available')
             return
+        
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+        goal_msg.pose.pose.position.z = 0.0
+        
+        # Set orientation from yaw
+        goal_msg.pose.pose.orientation.x = 0.0
+        goal_msg.pose.pose.orientation.y = 0.0
+        goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        
+        self.get_logger().info(f'Sending Nav2 step goal: ({x:.2f}, {y:.2f}), yaw={math.degrees(yaw):.1f}°')
+        self.navigation_goal_active = True
+        
+        send_goal_future = self.nav_to_pose_client.send_goal_async(goal_msg)
+        send_goal_future.add_done_callback(self.nav_goal_response_callback)
 
-        # Linija je vidna v spodnjem ROI-ju -> smo "na" celici.
-        self._stop()
-        self.get_logger().info('Reached cell, line visible underneath. State -> ALIGNING')
-        self.state = CellState.ALIGNING
-
-    def _do_aligning(self, image: np.ndarray, color: str):
-        """
-        Zavrti se v desno (negativna angular.z, robotska konvencija desno = -z
-        po common REP-103; prilagodi znak, če je tvoj robot obraten), dokler
-        kontura linije ni dovolj navpična v sliki (kar pomeni, da je robot
-        obrnjen vzdolž linije, proti njenemu 'desnemu' koncu).
-        """
-        result = self.detect_color_for_navigation(image, color)
-
-        if result is None:
-            # linijo smo med obratom izgubili iz vidnega polja - rahlo se vrti
-            # naprej v isto smer, lahko spet pride v kader
-            self._publish_cmd(0.0, -self.align_angular_speed)
-            self._frames_without_line += 1
-            if self._frames_without_line > self.line_lost_threshold * 25:
-                self.get_logger().warning(
-                    'Lost line for too long while aligning, stopping as a precaution.'
-                )
-                self._stop()
-                self.state = CellState.IDLE
-            return
-
-        self._frames_without_line = 0
-        angle = result['angle_deg']
-
-        if abs(angle) <= self.alignment_tolerance_deg:
-            self._stop()
-            self.get_logger().info(
-                f'Aligned with line (angle={angle:.1f} deg). State -> FOLLOWING_TO_FAR_END'
-            )
-            self._frames_without_line = 0
-            self.state = CellState.FOLLOWING_TO_FAR_END
-            return
-
-        # Obračaj se v desno, dokler kot ni znotraj tolerance.
-        # (Predznak self.align_angular_speed je negativen za "desno" po REP-103;
-        # prilagodi, če je tvoja konvencija drugačna.)
-        self._publish_cmd(0.0, -self.align_angular_speed)
-
-    def _do_following(self, image: np.ndarray, color: str, next_state: CellState):
-        """
-        Najpreprostejši delujoč line-follower: P-regulator na horizontalni
-        offset centra linije od sredine slike. Ko linije ne vidimo
-        `line_lost_threshold` zaporednih framov, štejemo, da smo prišli do
-        konca in preidemo v naslednjo fazo.
-        """
-        result = self.detect_color_for_navigation(image, color)
-
-        if result is None:
-            self._frames_without_line += 1
-            self._stop()
-            if self._frames_without_line >= self.line_lost_threshold:
-                self.get_logger().info(
-                    f'Line lost for {self._frames_without_line} frames - end of line reached. '
-                    f'State -> {next_state.name}'
-                )
+    def _do_first_pass_step(self, image: np.ndarray, color: str):
+        """Prvi prehod: korak v negativni smeri, preverjanje leve polovice ROI."""
+        if not self.navigation_goal_active:
+            # Prejšnji korak je zaključen, pošlji naslednji
+            if self._line_visible_in_roi_half(image, color, 'left'):
+                # črta je še vidna na levi -> pošlji naslednji korak
+                axis, _ = self._color_direction(color)
+                if axis == 'y':
+                    next_y = (self._current_goal_y or (self.red_cell_coord[1] if self.red_cell_coord else 0)) - self._step_size
+                    next_x = self._current_goal_x or (self.red_cell_coord[0] if self.red_cell_coord else 0)
+                else:  # 'x'
+                    next_x = (self._current_goal_x or (self.green_cell_coord[0] if self.green_cell_coord else 0)) - self._step_size
+                    next_y = self._current_goal_y or (self.green_cell_coord[1] if self.green_cell_coord else 0)
+                
+                self._current_goal_x = next_x
+                self._current_goal_y = next_y
+                self._send_step_goal(next_x, next_y)
+            else:
+                # črta ni vidna na levi -> konec prvega prehoda, preidi na zavoj
+                self.get_logger().info('Line lost on left side. State -> TURNING_180')
+                self.state = CellState.TURNING_180
                 self._frames_without_line = 0
-                self.state = next_state
-            return
 
-        self._frames_without_line = 0
-        offset_x = result['offset_x']
+    def _do_turn_180(self, image: np.ndarray, color: str):
+        """Zavoj za 180°: pošlji Nav2 cilj na isti lokaciji, samo z yaw+180."""
+        if not self.navigation_goal_active:
+            self.get_logger().info('Starting 180° turn via Nav2')
+            yaw_180 = math.pi  # 180°
+            self._send_step_goal(self._current_goal_x, self._current_goal_y, yaw=yaw_180)
+            self.state = CellState.RETURN_PASS_STEPPING
+            self._frames_without_line = 0
 
-        # P-regulator: angular.z proporcionalen offsetu, s saturacijo.
-        angular_z = -self.follow_angular_gain * offset_x
-        angular_z = max(-self.follow_max_angular_speed,
-                         min(self.follow_max_angular_speed, angular_z))
-
-        self._publish_cmd(self.follow_linear_speed, angular_z)
-
-    def _do_turning_180(self):
-        """
-        Časovno voden obrat za ~180 stopinj. Enostavna rešitev brez odometrije:
-        vrti se s fiksno kotno hitrostjo za izračunan čas. Če imaš na voljo
-        odometrijo/IMU, je bolje obrat voditi po dejanskem kotu - to je
-        najpreprostejša verzija, ki dela "dovolj dobro" za zdaj.
-        """
-        if self._turn_start_time is None:
-            self._turn_start_time = self.get_clock().now()
-            self._turn_target_duration = math.pi / self.turn_180_angular_speed
-            self.get_logger().info(
-                f'Starting 180 deg turn, estimated duration {self._turn_target_duration:.2f}s'
-            )
-
-        elapsed = (self.get_clock().now() - self._turn_start_time).nanoseconds / 1e9
-
-        if elapsed >= self._turn_target_duration:
-            self._stop()
-            self._turn_start_time = None
-            self._turn_target_duration = None
-            self.get_logger().info('180 deg turn complete. State -> PREPARING_TILE_DETECTION')
-            self.state = CellState.PREPARING_TILE_DETECTION
-            return
-
-        self._publish_cmd(0.0, self.turn_180_angular_speed)
+    def _do_return_pass_step(self, image: np.ndarray, color: str):
+        """Povratni prehod: korak v pozitivni smeri, preverjanje desne polovice ROI."""
+        if not self.navigation_goal_active:
+            # Prejšnji korak je zaključen, pošlji naslednji
+            if self._line_visible_in_roi_half(image, color, 'right'):
+                # črta je še vidna na desni -> pošlji naslednji korak
+                axis, _ = self._color_direction(color)
+                if axis == 'y':
+                    next_y = self._current_goal_y + self._step_size
+                    next_x = self._current_goal_x
+                else:  # 'x'
+                    next_x = self._current_goal_x + self._step_size
+                    next_y = self._current_goal_y
+                
+                self._current_goal_x = next_x
+                self._current_goal_y = next_y
+                self._send_step_goal(next_x, next_y)
+            else:
+                # črta ni vidna na desni -> konec povratnega prehoda, pripravi tile detection
+                self.get_logger().info('Line lost on right side. State -> PREPARING_TILE_DETECTION')
+                self.state = CellState.PREPARING_TILE_DETECTION
+                self._frames_without_line = 0
 
     def _do_preparing_tile_detection(self):
-        """Dvigne kamero in pošlje start signal, nato preide na pot nazaj."""
-        self.raise_top_camera()
-        self.start_tile_detection()
-        self._frames_without_line = 0
-        self.get_logger().info('Tile detection prepared. State -> FOLLOWING_BACK')
-        self.state = CellState.FOLLOWING_BACK
+        """Dvigne kamero in pošlje start signal, nato se zaključi."""
+        if not self.navigation_goal_active:
+            self.raise_top_camera()
+            self.start_tile_detection()
+            self.get_logger().info('Tile detection started. State -> DONE')
+            self.state = CellState.DONE
 
     # ------------------------------------------------------------------
     # Obstoječe pomožne metode
     # ------------------------------------------------------------------
 
     def raise_top_camera(self):
+
         """Dvigne zgornjo kamero v položaj za tile detection."""
         command = 'look_at_belt_right'
         self.arm_mover_pub.publish(String(data=command))
@@ -924,12 +914,13 @@ class RedGreenCellDetection(Node):
         """Objavi stop signal za tile detection in ustavi node."""
         self.search_active = False
         self.task_active = False
-        self._stop()
         self.tile_stop_pub.publish(Bool(data=True))
         self.get_logger().info('Tile detection stop signal sent')
         self.state = CellState.DONE
 
-        # ZA DODAT, DA RESETIRA POZICIJO KAMERE
+        command = 'look_for_qr'
+        self.arm_mover_pub.publish(String(data=command))
+        self.get_logger().info('Sent arm mover command: look_for_qr')
 
         self.get_logger().info('Shutting down node...')
         self.destroy_node()
