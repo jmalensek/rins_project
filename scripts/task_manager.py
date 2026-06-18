@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 # pip install vosk --break-system-packages
-# pip install sounddevice --break-system-packages
 # pip install reportlab --break-system-packages
 
 # V RINS PROJECT DOWNLOAD VOSK MODEL (https://alphacephei.com/vosk/models) v src/rins_project/vosk-model-en-us-0.22
@@ -60,26 +59,11 @@ from reportlab.platypus import (
 
 
 TASK_KEYWORDS = {
-    "Barrels inspection": ["barrel", "barrels", "cylinder", "cylinders", "battles"],
+    "Barrels inspection": ["barrel", "barrels", "cylinder", "cylinders", "inspection"],
     "Counting rings":     ["ring", "rings", "count rings", "circles"],
-    "Tile inspection":    ["tile", "tiles", "cell", "anomaly", "anomalies", "inspect"],
+    "Anomaly detection":    ["tile", "tiles", "cell", "anomaly", "anomalies"],
 }
 MIN_TASK_SCORE = 0.45
-
-GRAMMAR = _json.dumps([
-    # Barrels
-    "barrel", "barrels", "cylinder", "cylinders", "inspection", "barrel inspection",
-    # Rings
-    "ring", "rings", "count rings", "count the rings",
-    # Tile inspection
-    "tile", "tiles", "cell", "anomaly", "anomalies",
-    # Colors (for tile inspection follow-up)
-    "red", "red cell", "green", "green cell",
-    # Confirmation
-    "yes", "i am sure", "sure", "correct",
-    # Fallback
-    "nothing", "none", "[unk]"
-])
 
 
 def classify_task(raw: str) -> tuple[str | None, float]:
@@ -121,9 +105,12 @@ class TaskNode(Node):
     def __init__(self):
         super().__init__("task_node")
 
+        #self.listen = self._listen_for_task_voice
+        self.listen = self._listen_for_task
+
         # Optional offline STT configuration (Vosk)
-        #self.model_path = "/home/lea/colcon_ws/vosk-model-en-us-0.22"
-        self.model_path = "./src/rins_project/vosk-model-en-us-0.22"
+        self.model_path = "/home/lea/colcon_ws/vosk-model-en-us-0.22"
+        #self.model_path = "./src/rins_project/vosk-model-en-us-0.22"
         self.declare_parameter("mic_device_index", -1)
 
         self._vosk_model = None
@@ -131,7 +118,7 @@ class TaskNode(Node):
             self.get_logger().error("Vosk ni na voljo (import failed). Voice STT disabled.")
         else:
             try:
-                self.get_logger().info(f"🎤 Loading Vosk model once: {self.model_path}")
+                self.get_logger().info(f"Loading Vosk model once: {self.model_path}")
                 self._vosk_model = Model(self.model_path)
             except Exception as exc:
                 self.get_logger().error(f"Failed to load Vosk model from '{self.model_path}': {exc}")
@@ -148,6 +135,7 @@ class TaskNode(Node):
         # Shramba: {ime: task}
         self.task_memory: dict[str, str] = {}
         self._task_memory_lock = threading.Lock()
+        self.task_person: dict[str, str] = {}
 
         # Čaka na nalogo (dialog poteka v ločenem threadu)
         self._task_input: str | None = None
@@ -158,6 +146,7 @@ class TaskNode(Node):
         self.create_subscription(String, "/current_person", self._person_cb, 10)
         # /task_input = simulacija mikrofona; zamenjaj z STT ko bo na voljo
         self.create_subscription(String, "/task_input", self._task_input_cb, 10)
+        self.approach_active_pub = self.create_publisher(Bool, "/approach_active", 10)
 
         self.start_task_anomaly_pub = self.create_publisher(Bool, "/task_manager/task_started", 10)
         self.color_of_the_cell_pub = self.create_publisher(String, "/task_manager/color_of_the_cell", 10)
@@ -208,7 +197,7 @@ class TaskNode(Node):
         Returns (task, raw_text) or None on failure."""
         MAX_ATTEMPTS = 3
         for attempt in range(MAX_ATTEMPTS):
-            raw = self._listen_for_task_voice()
+            raw = self.listen()
             if raw is None:
                 return None
 
@@ -220,7 +209,7 @@ class TaskNode(Node):
 
             if attempt < MAX_ATTEMPTS - 1:
                 self.say("I didn't catch that, can you please repeat?")
-                time.sleep(2)
+                #time.sleep(2)
 
         self.say("I'm sorry, I could not understand the task.")
         return None
@@ -375,7 +364,7 @@ class TaskNode(Node):
             while undecided:
                 self.say(f"You want me to perform {task}. Are you sure?")
                 time.sleep(3)
-                raw = self._listen_for_task_voice()
+                raw = self.listen()
                 if raw is None:
                     self.get_logger().warn(f"No task received for {name}.")
                     return
@@ -396,18 +385,20 @@ class TaskNode(Node):
 
         # Shrani
         with self._task_memory_lock:
-            self.task_memory[name] = task
+            self.task_memory[task] = name
             self.task_results[name] = self._empty_result(task)
+
+        self.task_person[task] = name
 
         self.say(f"Understood. I will perform: {task}.")
 
-        if task == "Tile inspection":
+        if task == "Anomaly detection":
             # Try to extract color from the utterance; ask if missing
             color = self._extract_color(raw_text)
             if color is None:
                 self.say("Which cell should I inspect, red or green?")
                 time.sleep(1)
-                color_raw = self._listen_for_task_voice()
+                color_raw = self.listen()
                 if color_raw:
                     color = self._extract_color(color_raw)
 
@@ -417,6 +408,9 @@ class TaskNode(Node):
             if color:
                 self.color_of_the_cell_pub.publish(String(data=color))
 
+        self.approach_active_pub.publish(Bool(data=False))
+        
+
 
     # ── Rezultati ─────────────────────────────────────────────────────────────
 
@@ -425,7 +419,7 @@ class TaskNode(Node):
             return {"task": task, "total": 0, "by_color": {}}
         if task == "Barrels inspection":
             return {"task": task, "total": 0, "barrels": []}
-        if task == "Tile inspection":
+        if task == "Anomaly detection":
             return {"task": task, "total": 0, "tiles": []}
         return {"task": task}
 
@@ -446,7 +440,7 @@ class TaskNode(Node):
                 self.task_results[person].update({"total": total, "barrels": barrels})
 
     def set_tiles_result(self, person: str, total: int, tiles: list[dict]) -> None:
-        """Nastavi rezultat za Tile inspection.
+        """Nastavi rezultat za Anomaly detection.
         tiles primer: [{"id": 1, "status": "OK"}, {"id": 2, "status": "NOK"}, ...]
         """
         with self._task_memory_lock:
@@ -514,6 +508,49 @@ class TaskNode(Node):
     def get_task_for_person(self, name: str) -> str | None:
         with self._task_memory_lock:
             return self.task_memory.get(name)
+        
+
+    # DODAJ RESULTS CALLBACK
+    """
+    NPR RINGS CALLBACK:
+    person = self.task_person["Counting Rings"]
+
+    self.set_rings_result(
+    person="John",
+    total=6,
+    by_color={
+        "red": 3,
+        "blue": 2,
+        "green": 1
+    }
+    )"""
+
+    """
+    self.set_barrels_result(
+    person="Anna",
+    total=3,
+    barrels=[
+        {"id": 1, "colour": "red", "orientation": "vertical", "leak": True},
+        {"id": 2, "colour": "blue", "orientation": "horizontal", "leak": False},
+        {"id": 3, "colour": "green", "orientation": "vertical", "leak": False}
+    ]
+)
+    """
+
+
+    """
+    self.set_tiles_result(
+    person="Mark",
+    total=5,
+    tiles=[
+        {"id": 1, "status": "OK"},
+        {"id": 2, "status": "OK"},
+        {"id": 3, "status": "NOK"},
+        {"id": 4, "status": "OK"},
+        {"id": 5, "status": "NOK"}
+    ]
+)
+    """
 
 
     #-------------------------------------------------
@@ -631,7 +668,7 @@ class TaskNode(Node):
                             ))
                             section.append(RLImage(str(img_path), width=8*cm, height=6*cm))
 
-        elif task == "Tile inspection":
+        elif task == "Anomaly detection":
             total = result.get("total", 0)
             tiles = result.get("tiles", [])
             section.append(Paragraph(f"Total tiles: <b>{total}</b>", styles["Normal"]))
