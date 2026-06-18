@@ -3,49 +3,29 @@
 '''
 Node, ki bo, kadar se ustavi na zelenem/rdečem cellu - ustavil se bo na enem koncu in potem šel proti drugemu
 naredil bo tile detection (vprašanje, koliko ploščic je?)
-za vsako ploščico bo naredil homografijo - da bo kvadrat
-v datasetu imamo kvadratne slike velikosti 512x512 
-se pravi ta node bo samo loadal model za anomaly detection, potem pa bo za vsako ploščico naredil homografijo in sliko poslal modelu
-mora tudi shraniti koliko ploščic je - se pravi število ploščic ki imajo anomalije, in število, ki nima anomalij
-
-
-imamo tudi kamero: top_camera
-
-število ploščic je toliko da so od enega konca linije do drugega
-
-da hkrati laufata cell detection in tile detection node
-
-da si explerer zapomni koordinate rdečih /zelenih cellov, pa potem se vklopi 
-cell detection, kjer poišče en konec linije, pa se počasi premika do drugega konca
-
-najprej gre na desni konec, kamero pa ma gor na desno stran
-
-ko dobi task - preko topica dobi kateri cell mora obiskat
-
-
-potem je tukaj še vprašanje detekcije pravilnega cella - pasiven node, ki si shrani koordinate za rdeč in zelen cell
-
-na task managerju se sproži cell detectiong, pa dobi ta task, in se vžge
-
+...
 '''
-
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
+from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Bool
+import sensor_msgs_py.point_cloud2 as pc2
 
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
-from pathlib import Path
-import json
 from datetime import datetime
 import subprocess
 
 from anomaly_detector import AnomalyDetector
+
+
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
 
 
 class detect_tiles(Node):
@@ -56,7 +36,7 @@ class detect_tiles(Node):
             namespace='',
             parameters=[
                 ('device', ''),
-                ('model_path', 'best_model.pth'), # TREBA ACTUALLY PREVERIT KJE JE LOCIRAN
+                ('model_path', '/home/kappa/Documents/Task2/src/rins_project/best_model.pth'), 
                 ('tile_size', 512),
                 ('confidence_threshold', 0.5),
                 ('tile_detection_start_topic', '/tile_detection/start'),
@@ -70,17 +50,36 @@ class detect_tiles(Node):
         self.tile_detection_start_topic = self.get_parameter('tile_detection_start_topic').get_parameter_value().string_value
         self.tile_detection_stop_topic = self.get_parameter('tile_detection_stop_topic').get_parameter_value().string_value
 
-        self.last_processed_tile_center = None
-        self.tile_center_threshold = 50  # pixels
-        self.detection_active = False  # Flag to control when tile detection is active
+        # Replace pointcloud tracking with TF2 components
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # Spatial tracking (X, Y in meters relative to 'map' or 'odom' frame)
+        self.processed_tile_positions = []  # List of (x, y) tuples in meters
+        self.distance_threshold_meters = 0.25
+        self.detection_active = False  
+
+        # You can remove the pointcloud subscriber entirely if you don't need it for anything else!
+        self.latest_pointcloud = None
 
         self.bridge = CvBridge()
-        self.scan = None
         self.detector = self.load_model()
 
-        self.image_sub = self.create_subscription(Image, "/top_camera/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
+        # Subscriptions
+        self.pointcloud_sub = self.create_subscription(
+            PointCloud2,
+            '/oakd/rgb/preview/depth/points',
+            self.pointcloud_callback,
+            qos_profile_sensor_data,
+        )
+
+        self.image_sub = self.create_subscription(
+            Image, 
+            "/top_camera/rgb/preview/image_raw", 
+            self.image_callback, 
+            qos_profile_sensor_data
+        )
         
-        # Subscribe to tile detection start/stop signals
         self.tile_start_sub = self.create_subscription(Bool, self.tile_detection_start_topic, self.on_tile_detection_start, 10)
         self.tile_stop_sub = self.create_subscription(Bool, self.tile_detection_stop_topic, self.on_tile_detection_stop, 10)
 
@@ -92,6 +91,28 @@ class detect_tiles(Node):
 
         self.get_logger().info("Tile detection node initialized")
 
+    def get_robot_pose_in_map(self):
+        """
+        Looks up the current 2D position (X, Y) of the robot in the global map frame.
+        """
+        try:
+            # Target frame: 'map', Source frame: 'base_link' (robot center)
+            now = rclpy.time.Time()
+            trans = self.tf_buffer.lookup_transform('map', 'base_link', now)
+            
+            x = trans.transform.translation.x
+            y = trans.transform.translation.y
+            return (x, y)
+            
+        except TransformException as ex:
+            self.get_logger().warning(f"Could not transform 'base_link' to 'map': {ex}")
+            return None
+
+    def pointcloud_callback(self, msg: PointCloud2):
+        """Stores the incoming point cloud message for spatial distance calculations."""
+        self.latest_pointcloud = msg
+
+
     def say(self, text):
         """Use system spd-say for text-to-speech"""
         try:
@@ -100,26 +121,21 @@ class detect_tiles(Node):
             print(f"spd-say not found. Would say: {text}")
 
     def load_model(self):
-        # Use the existing AnomalyDetector class to load the model and handle preprocessing.
-        detector = AnomalyDetector(
+        return AnomalyDetector(
             model_path=self.model_path,
             threshold=self.confidence_threshold,
             device=self.device if self.device else None
         )
-        return detector
 
     def on_tile_detection_start(self, msg: Bool):
-        """Callback when tile detection start signal is received."""
         if msg.data:
             self.detection_active = True
             self.get_logger().info("Tile detection activated")
 
     def on_tile_detection_stop(self, msg: Bool):
-        """Callback when tile detection stop signal is received."""
         if msg.data:
             self.detection_active = False
             self.get_logger().info("Tile detection deactivated")
-            self.get_logger().info("Shutting down tile detection node...")
             self.print_detected_tiles()
             self.destroy_node()
             rclpy.shutdown()
@@ -130,12 +146,9 @@ class detect_tiles(Node):
         print(f"Normal tiles: {self.tiles['normal']}")
             
     def detect_tiles(self, image):
-        # vrača lista s konturami ploščic
-
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # thresholding - treba prilagoditi vrednosti po potrebi
         _, binary = cv2.threshold(blurred, 100, 255, cv2.THRESH_BINARY)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
@@ -144,9 +157,11 @@ class detect_tiles(Node):
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         tiles = []
 
-        # za prilagodit
         min_area = 5000
         max_area = 50000
+        
+        height, width = image.shape[:2]
+        border_margin = 1  
 
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -157,8 +172,19 @@ class detect_tiles(Node):
                 if len(approx) != 4:
                     continue
 
-                x, y, w, h = cv2.boundingRect(approx)
+                # Filter out tiles cut off by image borders
+                points = approx.reshape(4, 2)
+                touches_border = False
+                for pt in points:
+                    if (pt[0] <= border_margin or pt[0] >= width - border_margin or
+                        pt[1] <= border_margin or pt[1] >= height - border_margin):
+                        touches_border = True
+                        break
+                
+                if touches_border:
+                    continue
 
+                x, y, w, h = cv2.boundingRect(approx)
                 aspect_ratio = w / float(h)
 
                 if not (0.7 < aspect_ratio < 1.3):
@@ -166,36 +192,37 @@ class detect_tiles(Node):
 
                 tiles.append(approx)
 
-        for idx, tile in enumerate(tiles):
-            self.get_logger().info(
-                f"Tile {idx}: shape={tile.shape}, area={cv2.contourArea(tile)}"
-            )
         return tiles
 
     def get_perspective_transform(self, contour, tile_size=512):
-        dst_points = np.array([[0, 0], [tile_size, 0], [tile_size, tile_size], [0, tile_size]], dtype=np.float32)
+        pts = contour.reshape(4, 2).astype(np.float32)
+        rect = np.zeros((4, 2), dtype=np.float32)
 
-        contour = contour.reshape(4, 2).astype(np.float32)
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]  
+        rect[2] = pts[np.argmax(s)]  
 
-        top = contour[:2][np.argsort(contour[:2, 0])]
-        bottom = contour[2:][np.argsort(contour[2:, 0])]
-        src_points = np.stack([top, bottom[::-1]]).astype(np.float32)
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]  
+        rect[3] = pts[np.argmax(diff)]  
 
-        H = cv2.getPerspectiveTransform(src_points, dst_points)
-        return H
+        dst = np.array([
+            [0, 0],
+            [tile_size - 1, 0],
+            [tile_size - 1, tile_size - 1],
+            [0, tile_size - 1]
+        ], dtype=np.float32)
+
+        return cv2.getPerspectiveTransform(rect, dst)
     
     def warp_tile(self, image, H, tile_size=512):
-        warped = cv2.warpPerspective(image, H, (tile_size, tile_size))
-        return warped
+        return cv2.warpPerspective(image, H, (tile_size, tile_size))
     
     def predict_anomaly(self, tile_image, save_path=None):
-        # Use the detector's public prediction method, optionally saving a report.
         is_anomaly = self.detector.detect(tile_image, save_path=save_path)
-        confidence = 1.0 if is_anomaly else 0.0
-        return is_anomaly, confidence
+        return is_anomaly, 1.0 if is_anomaly else 0.0
 
     def get_tile_center(self, contour):
-        """Calculate the center point of a tile contour"""
         M = cv2.moments(contour)
         if M['m00'] != 0:
             cx = int(M['m10'] / M['m00'])
@@ -203,12 +230,7 @@ class detect_tiles(Node):
             return (cx, cy)
         return None
 
-
-    # callback ko prejme sliko iz top kamere
     def image_callback(self, msg):
-
-        self.get_logger().info("Received image from top camera")
-
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except CvBridgeError as e:
@@ -218,60 +240,51 @@ class detect_tiles(Node):
         cv2.imshow("Top Camera View", cv_image)
         cv2.waitKey(1)
         
-        # Only process tiles if detection is active
         if not self.detection_active:
             return
         
         tiles_contours = self.detect_tiles(cv_image)
 
         debug_image = cv_image.copy()
-
-        cv2.drawContours(
-            debug_image,
-            tiles_contours,
-            -1,
-            (0, 255, 0),
-            3
-        )
-
+        cv2.drawContours(debug_image, tiles_contours, -1, (0, 255, 0), 3)
         cv2.imshow("Detected Tiles", debug_image)
         cv2.waitKey(1)
 
         if not tiles_contours:
-            self.get_logger().info("No tiles detected in the image.")
             return
-        self.get_logger().info(f"Detected {len(tiles_contours)} tiles in the image.")
 
-        # Take the most prominent/largest tile (or center tile)
-        largest_tile = max(tiles_contours, key=cv2.contourArea)
-        center = self.get_tile_center(largest_tile)
-        
-        if center is None:
+        self.get_logger().info(f"Detected {len(tiles_contours)} candidate tiles.")
+
+        # Get where the robot is globally standing right now
+        robot_pose = self.get_robot_pose_in_map()
+        if robot_pose is None:
+            self.get_logger().warning("Skipping tile processing: Robot global pose unavailable.")
             return
-        
-        # Skip if it's the same tile as last frame
-        if self.last_processed_tile_center is not None:
-            distance = np.sqrt((center[0] - self.last_processed_tile_center[0])**2 + 
-                            (center[1] - self.last_processed_tile_center[1])**2)
-            if distance < self.tile_center_threshold:
-                return  # Same tile, skip
-        
-        # New tile detected
-        self.last_processed_tile_center = center
-        # za vsako ploščico:
+
+        robot_x, robot_y = robot_pose
+
+        # Process the detected contours
         for idx, contour in enumerate(tiles_contours):
+            
+            # 1. Distance constraint check based purely on global robot location
+            is_duplicate = False
+            for old_x, old_y in self.processed_tile_positions:
+                # 2D Euclidean distance check in meters
+                distance = np.sqrt((robot_x - old_x)**2 + (robot_y - old_y)**2)
+                if distance < self.distance_threshold_meters:
+                    is_duplicate = True
+                    break
+                    
+            if is_duplicate:
+                # Robot hasn't moved 0.25 meters away from the last logged tile position yet
+                continue
+                
+            # If it's a completely fresh tile location sequence step:
+            self.processed_tile_positions.append((robot_x, robot_y))
+            self.get_logger().info(f"New tile registered at robot map position: X={robot_x:.2f}, Y={robot_y:.2f}")
 
+            # 2. Proceed safely with homography and your AI model evaluation
             try:
-                self.get_logger().info(
-                    f"Processing tile {idx}, contour shape: {contour.shape}"
-                )
-
-                pts = contour.reshape(-1, 2)
-
-                self.get_logger().info(
-                    f"Points: {pts.tolist()}"
-                )
-
                 H = self.get_perspective_transform(contour, self.tile_size)
                 warped_tile = self.warp_tile(cv_image, H, self.tile_size)
                 
@@ -287,16 +300,13 @@ class detect_tiles(Node):
                     self.say("Anomaly detected")
                 else:
                     self.tiles['normal'] += 1
+                    
             except Exception as e:
                 self.get_logger().error(f"Error processing tile {idx}: {e}")
                 continue
 
-
-
-
 def main():
     print('Tile detection node starting.')
-
     rclpy.init(args=None)
     node = detect_tiles()
     try:
@@ -305,9 +315,7 @@ def main():
         print("Shutting down tile detector.")
     finally:
         node.print_detected_tiles()
-
         node.destroy_node()
-        
         try:    
             rclpy.shutdown()
         except Exception as e:
