@@ -166,7 +166,8 @@ class YellowLineDetector(Node):
         self.pub_offset.publish(Float32(data=float(offset_px)))
 
         if ahead:
-            self.get_logger().warn(f"Yellow line ahead; Offset={offset_px:.1f} px, ratio={yellow_ratio:.3f}")
+            #self.get_logger().warn(f"Yellow line ahead; Offset={offset_px:.1f} px, ratio={yellow_ratio:.3f}")
+            pass
 
 
 def main(args=None):
