@@ -22,15 +22,23 @@ def generate_launch_description() -> LaunchDescription:
 
     args = [
         DeclareLaunchArgument('namespace', default_value='', description='Robot namespace'),
-        DeclareLaunchArgument('run_detect_people2', default_value='true', description='Run detect_people2.py'),
+        DeclareLaunchArgument('run_detect_people2', default_value='true', description='Run DETECT_PEOPLE_2s.py'),
         DeclareLaunchArgument('run_detect_rings27', default_value='true', description='Run detect_rings27.py'),
-        DeclareLaunchArgument('run_greet_people', default_value='true', description='Run greet_people_faster.py'),
+        DeclareLaunchArgument('run_task_manager', default_value='true', description='Run task_manager.py'),
+        DeclareLaunchArgument('run_red_green_cell_detection_better', default_value='true', description='Run red_green_cell_detection_better.py'),
+        DeclareLaunchArgument('run_tile_detection', default_value='true', description='Run tile_detection.py'),
+        DeclareLaunchArgument('run_cylinder_segmentation', default_value='true', description='Run cylinder_segmentation'),
+        #DeclareLaunchArgument('run_arm_mover', default_value='true', description='Run arm_mover.py'),
     ]
 
     nodes = [
-        _script_node('detect_people2.py', 'run_detect_people2', namespace),
+        _script_node('DETECT_PEOPLE_2s.py', 'run_detect_people2', namespace),
         _script_node('detect_rings27.py', 'run_detect_rings27', namespace),
-        _script_node('greet_people_faster.py', 'run_greet_people', namespace),
+        _script_node('task_manager.py', 'run_task_manager', namespace),
+        _script_node('red_green_cell_detection_better.py', 'run_red_green_cell_detection_better', namespace),
+        _script_node('tile_detection.py', 'run_tile_detection', namespace),
+        _script_node('cylinder_segmentation', 'run_cylinder_segmentation', namespace),
+        #_script_node('arm_mover.py', 'run_arm_mover', namespace),
     ]
 
     return LaunchDescription(args + nodes)
