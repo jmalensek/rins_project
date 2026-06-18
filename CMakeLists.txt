@@ -88,6 +88,7 @@ install(PROGRAMS
   scripts/anomaly_detector.py
   scripts/task_manager.py
   scripts/red_green_cell_detection.py
+  scripts/red_green_cell_detection_better.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
