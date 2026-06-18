@@ -1,5 +1,7 @@
 #! /usr/bin/env python3
 
+from importlib.resources import path
+
 import rclpy
 import time
 import math
@@ -10,6 +12,7 @@ from collections import deque
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, Quaternion
+from nav2_msgs.srv import ComputePathToPose
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import TwistStamped
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -139,6 +142,11 @@ class RobotExplorer(Node):
 
         # Publisher for visualizing a grid of markers on RViz
         self.pub_grid_marker = self.create_publisher(Marker, "/visual_grid", 10)
+
+        self.compute_path_client = self.create_client(ComputePathToPose, '/compute_path_to_pose')
+
+        while not self.compute_path_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Waiting for ComputePathToPose service...")
 
         # Initialisation successful
         self.get_logger().info(f"Robot explorer has been initialized!")
@@ -564,7 +572,7 @@ class RobotExplorer(Node):
 
     # Sequentially visits a set of waypoints on a provided map
     # In area1 of task2, the robot is to avoid crossing the yellow line, so a special method is used
-    def cover_waypoints_area1(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, sidestep_distance: float = 0.3, wait_time: float = 1.0, localise: bool = True) -> None:
+    def cover_waypoints_area1_basic(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, sidestep_distance: float = 0.3, wait_time: float = 1.0, localise: bool = True) -> None:
         for index, (x, y) in enumerate(waypoints):
 
             """
@@ -645,8 +653,83 @@ class RobotExplorer(Node):
                     self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
                     break
 
+    # Visits points in area1 of task 2 by computing the cost to each unvisited point and moving to the closest one, while avoiding obstacles and the yellow line
+    def cover_waypoints_area1_optimized(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, sidestep_distance: float = 0.3, wait_time: float = 1.0, localise: bool = True) -> None:
+        
+        current_point = waypoints[0]  
+        unvisited_waypoints = waypoints.copy()
+
+        while unvisited_waypoints:
+            (x, y) = current_point
+
+            # Some new active approach interruption mechanism, that I don't fully understand
+            while self.actively_approaching:
+                self.get_logger().info("Active approach in progress, waiting...")
+
+                # Wait a short while before checking again
+                rclpy.spin_once(self, timeout_sec=0.1)
+
+            # Rotate to help with localisation
+            if localise:
+                self.rotate(turns, angular_speed, wait_time)
+
+            # Move to the next point
+            if not self.go_to_pose(x, y, yaw=0.0):
+                self.get_logger().error(f"Failed to send goal to ({x:.2f}, {y:.2f})")
+                continue
+            
+            while rclpy.ok():
+                rclpy.spin_once(self, timeout_sec=0.0)
+
+                # If a yellow line is detected ahead while moving, cancel the current goal
+                #if self.yellow_ahead and self.is_moving():                
+                #    cancel_future = self.goal_handle.cancel_goal_async()
+                #    rclpy.spin_until_future_complete(self, cancel_future)
+                #    self.turn_odom(math.pi/2, angular_speed=angular_speed)
+                #    break
+
+                # If an obstacle is detected, check obstacle_nearest_direction and sidestep accordingly
+                if self.obstacle_detected:
+                    if self.obstacle_nearest_direction is not None:
+                        # Determine a temporary goal position away from the obstacl
+                        sidestep_angle = self.obstacle_nearest_direction + math.pi
+
+                        # Normalise the sidestep angle to be within [-pi, pi]
+                        sidestep_angle = self.normalize_angle(sidestep_angle)
+
+                        self.get_logger().info(f"Obstacle detected, sidestepping at angle {sidestep_angle:.2f} rad")
+
+                        # Turn the robot to face away from the obstacle and move
+                        self.turn_odom(sidestep_angle)
+                        self.move_straight_odom(sidestep_distance)                        
+
+                        # Resume the original goal after reaching the temporary goal
+                        if not self.go_to_pose(x, y, yaw=0.0):
+                            self.get_logger().error(f"Failed to resume goal to ({x:.2f}, {y:.2f})")
+                            break
+
+                if self.result_future.done():
+                    self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
+                    unvisited_waypoints.remove(current_point)
+                    break
+            
+            # Compute the next closest point
+            next_point = None
+            best_cost = float('inf')
+            for point in unvisited_waypoints:
+                cost = self.compute_nav_cost((x, y), point)
+                if cost < best_cost:
+                    best_cost = cost
+                    next_point = point
+
+            if next_point is None or best_cost is None:
+                self.get_logger().warn("No reachable unvisited waypoints remaining.")
+                break
+
+            current_point = next_point
+
     # Sequentially visits a set of waypoints on a provided map
-    def cover_waypoints(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0, localise: bool = True) -> None:
+    def cover_waypoints_basic(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, sidestep_distance: float = 0.3, wait_time: float = 1.0, localise: bool = True) -> None:
         for index, (x, y) in enumerate(waypoints):
 
             """
@@ -693,10 +776,32 @@ class RobotExplorer(Node):
                 self.get_logger().error(f"Failed to send goal to ({x:.2f}, {y:.2f})")
                 continue
             
-            if not self.wait_task_done(timeout_sec=30.0):
-                self.get_logger().error(f"Failed to reach ({x:.2f}, {y:.2f}) within timeout")
-            else:
-                self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
+            while rclpy.ok():
+                rclpy.spin_once(self, timeout_sec=0.0)
+
+                # If an obstacle is detected, check obstacle_nearest_direction and sidestep accordingly
+                if self.obstacle_detected:
+                    if self.obstacle_nearest_direction is not None:
+                        # Determine a temporary goal position away from the obstacl
+                        sidestep_angle = self.obstacle_nearest_direction + math.pi
+
+                        # Normalise the sidestep angle to be within [-pi, pi]
+                        sidestep_angle = self.normalize_angle(sidestep_angle)
+
+                        self.get_logger().info(f"Obstacle detected, sidestepping at angle {sidestep_angle:.2f} rad")
+
+                        # Turn the robot to face away from the obstacle and move
+                        self.turn_odom(sidestep_angle)
+                        self.move_straight_odom(sidestep_distance)                        
+
+                        # Resume the original goal after reaching the temporary goal
+                        if not self.go_to_pose(x, y, yaw):
+                            self.get_logger().error(f"Failed to resume goal to ({x:.2f}, {y:.2f})")
+                            break
+
+                if self.result_future.done():
+                    self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
+                    break
 
     # Simple routine to localise the robot on the map
     def localise_self(self, turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0) -> None:
@@ -879,6 +984,12 @@ class RobotExplorer(Node):
             x -= step
             row_index += 1
 
+        # Filter out all invalid points (e.g., points outside the image boundaries, or on occupied cells in the map)
+        for point in grid_points[:]:
+            mx, my = self._world_to_map(point[0], point[1])
+            if mx is None or my is None or self.cell(mx, my) != 0:
+                grid_points.remove(point)
+
         return grid_points
 
     # Computes the yaw between two absolute poses
@@ -928,6 +1039,53 @@ class RobotExplorer(Node):
     def compute_relative_distance(self, target_pose: tuple[float, float]) -> float:
         target_x, target_y = target_pose
         return math.sqrt(target_x ** 2 + target_y ** 2)
+    
+    # Computes the length of a path between to points
+    def path_length(self, path: ComputePathToPose.Response) -> float:
+        total = 0.0
+
+        poses = path.poses
+
+        for i in range(1, len(poses)):
+            p1 = poses[i - 1].pose.position
+            p2 = poses[i].pose.position
+
+            total += math.hypot(p2.x - p1.x, p2.y - p1.y)
+
+        return total
+    
+    # Computes the navigation cost between two poitions
+    def compute_nav_cost(self, start_xy: tuple[float, float], goal_xy: tuple[float, float]) -> float | None:
+
+        start = PoseStamped()
+        start.header.frame_id = "map"
+        start.pose.position.x = start_xy[0]
+        start.pose.position.y = start_xy[1]
+        start.pose.orientation.w = 1.0
+
+        goal = PoseStamped()
+        goal.header.frame_id = "map"
+        goal.pose.position.x = goal_xy[0]
+        goal.pose.position.y = goal_xy[1]
+        goal.pose.orientation.w = 1.0
+
+        req = ComputePathToPose.Request()
+        req.start = start
+        req.goal = goal
+
+        future = self.compute_path_client.call_async(req)
+
+        rclpy.spin_until_future_complete(self, future)
+
+        result = future.result()
+
+        if result is None:
+            return None
+
+        if len(result.path.poses) == 0:
+            return None
+
+        return self.path_length(result.path)
 
     # Get the robot's current position
     def get_current_position_amcl(self) -> tuple[float, float]:
@@ -1356,16 +1514,16 @@ def main(args = None):
     # TASK 2
     # For line detection run detect_yellow_line.py and arm_mover_actions.py
     # For best view of both the yellow and blue line
-    re.cover_waypoints_area1(waypoints_task2_sim_area1, localise=False)
+    re.cover_waypoints_area1_basic(waypoints_task2_sim_area1, localise=False)
 
-    #re.cover_waypoints(waypoints_task2_sim_area1, localise=False)
+    #re.cover_waypoints_basic(waypoints_task2_sim_area1, localise=False)
 
     re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
 
     re.follow_blue_line()
 
     # TASK 1R
-    #re.cover_waypoints(waypoints_irl, wait_time=0.5, localise=True)
+    #re.cover_waypoints_basic(waypoints_irl, wait_time=0.5, localise=True)
     
     re.get_logger().info("Exploration complete, shutting down.")
     re.destroy_node()
