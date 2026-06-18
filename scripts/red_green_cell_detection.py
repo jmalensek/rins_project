@@ -50,9 +50,12 @@ from tf2_geometry_msgs import do_transform_point
 from rclpy.action import ActionClient
 
 from nav2_msgs.action import NavigateToPose
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped
 
 from action_msgs.msg import GoalStatus
+
+from tf_transformations import euler_from_quaternion
+from nav_msgs.msg import Odometry
 
 
 class CellState(Enum):
@@ -108,6 +111,8 @@ class RedGreenCellDetection(Node):
         self.turn_180_angular_speed = self.get_parameter('turn_180_angular_speed').get_parameter_value().double_value
         self.alignment_tolerance_deg = self.get_parameter('alignment_tolerance_deg').get_parameter_value().double_value
 
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+
         self.nav_to_pose_client = ActionClient(
             self,
             NavigateToPose,
@@ -139,6 +144,8 @@ class RedGreenCellDetection(Node):
         self._latest_pointcloud: PointCloud2 | None = None
         self._pending_red_pixel: tuple[int, int] | None = None
         self._pending_green_pixel: tuple[int, int] | None = None
+
+        self.current_yaw = None
 
         self.bridge = CvBridge()
 
@@ -176,12 +183,51 @@ class RedGreenCellDetection(Node):
             10,
         )
 
+        self.create_subscription(
+            Odometry,
+            '/odom',
+            self.odom_callback,
+            10
+        )
+
         self.tile_start_pub = self.create_publisher(Bool, self.tile_detection_start_topic, 10)
         self.tile_stop_pub = self.create_publisher(Bool, self.tile_detection_stop_topic, 10)
         self.arm_mover_pub = self.create_publisher(String, '/arm_command', 10)
         self.cmd_vel_pub = self.create_publisher(TwistStamped, 'cmd_vel', 10)
 
         self.get_logger().info('red_green_cell_detection node initialized')
+
+    def get_current_yaw(self):
+        try:
+            trans = self.tf_buffer.lookup_transform(
+                'odom',          # or 'map'
+                'base_link',
+                rclpy.time.Time()
+            )
+
+            q = trans.transform.rotation
+
+            import math
+            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            yaw = math.atan2(siny_cosp, cosy_cosp)
+
+            return yaw
+
+        except Exception as e:
+            return 0.0
+    def _get_yaw_from_odom(self, odom_msg):
+        q = odom_msg.pose.pose.orientation
+        quat = [q.x, q.y, q.z, q.w]
+        _, _, yaw = euler_from_quaternion(quat)
+        return yaw
+    def odom_callback(self, msg: Odometry):
+        q = msg.pose.pose.orientation
+
+        quat = [q.x, q.y, q.z, q.w]
+        _, _, yaw = euler_from_quaternion(quat)
+
+        self.current_yaw = self.get_current_yaw()
 
     def color_of_the_cell_callback(self, msg: String):
         self.color_of_the_cell = msg.data
@@ -351,25 +397,7 @@ class RedGreenCellDetection(Node):
         return (cx, cy)
 
     def detect_color_for_navigation(self, image: np.ndarray, color: str):
-        """
-        Zaznava barvnega madeža (blob) za potrebe poravnave in sledenja črti
-        (faze ALIGNING, FOLLOWING_TO_FAR_END, FOLLOWING_BACK ter preverjanje
-        vidnosti med approachom).
-
-        Za razliko od detect_line_of_color NE filtrira po aspect_ratio, ker
-        med sledenjem/poravnavo robot gleda VZDOLŽ črte - kontura je takrat
-        pričakovano ozka in visoka (oz. trapezoidna zaradi perspektive), kar
-        bi aspect_ratio filter v detect_line_of_color napačno zavrnil.
-
-        Returns a dict with:
-            'center': (cx, cy) v polnih slikovnih koordinatah
-            'angle_deg': odklon glavne osi konture od navpičnice v sliki
-                         (0.0 = kontura je navpična, robot gleda vzdolž črte)
-            'offset_x': cx - sredina_slike_x (predznačen horizontalni odklon)
-        ali None, če barva ni zaznana.
-        """
         h, w = image.shape[:2]
-
         floor_band_height = 80
         roi = image[h - floor_band_height:h, :]
 
@@ -387,58 +415,32 @@ class RedGreenCellDetection(Node):
         else:
             return None
 
-        mask = mask.astype(np.uint8) * 255
+        mask = mask.astype(np.uint8)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        # če premalo pikslov → nič
+        if np.count_nonzero(mask) <= 3:
+            self.get_logger().info(f"Detected {color} pixels, but too few to consider it a line.")
             return None
 
-        largest = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(largest)
-        if area < self.min_contour_area:
+        # centroid iz mask (isti princip kot moments)
+        M = cv2.moments(mask)
+        if M["m00"] == 0:
+            self.get_logger().info(f"Detected {color} pixels, but no valid centroid found.")
             return None
 
-        M = cv2.moments(largest)
-        if M['m00'] == 0:
-            return None
+        cx_roi = int(M["m10"] / M["m00"])
+        cy_roi = int(M["m01"] / M["m00"])
 
-        cx = int(M['m10'] / M['m00'])
-        cy_roi = int(M['m01'] / M['m00'])
+        # pretvorba v globalne koordinate slike
+        cx = cx_roi
         cy = cy_roi + (h - floor_band_height)
 
+        self.get_logger().info(f"Detected {color} line for navigation at ({cx}, {cy})")
 
-        offset_x = cx - (w / 2.0)
-
-
-        # PCA orientacija konture
-        pts = largest.reshape(-1, 2).astype(np.float32)
-
-        mean, eigenvectors, eigenvalues = cv2.PCACompute2(
-            pts,
-            mean=None
-        )
-
-        # glavna os konture
-        vx, vy = eigenvectors[0]
-
-        # kot glavne osi glede na vodoravnico
-        line_angle = np.degrees(np.arctan2(vy, vx))
-
-        # normalizacija na [-90, 90]
-        if line_angle > 90:
-            line_angle -= 180
-        elif line_angle < -90:
-            line_angle += 180
         return {
-            'center': (cx, cy),
-            'angle_deg': line_angle,
-            'offset_x': offset_x,
-            'direction': (float(vx), float(vy)),
+            "center": (cx, cy)
         }
+
 
     def pointcloud_callback(self, data: PointCloud2):
         """
@@ -582,7 +584,7 @@ class RedGreenCellDetection(Node):
         goal_x, goal_y = self.get_offset_goal(
             target_x,
             target_y,
-            offset=0.60
+            offset=0.7
         )
 
         goal_msg.pose.pose.position.x = target_x
@@ -653,10 +655,10 @@ class RedGreenCellDetection(Node):
                 self.get_logger().info('Reached initial cell area. State -> FIRST_PASS_STEPPING')
                 self.state = CellState.FIRST_PASS_STEPPING
                 # Initialize goal coordinates from target cell
-                if self.red_cell_coord:
+                if self.red_cell_coord and self.color_of_the_cell == 'red':
                     self._current_goal_x = self.red_cell_coord[0]
                     self._current_goal_y = self.red_cell_coord[1]
-                elif self.green_cell_coord:
+                elif self.green_cell_coord and self.color_of_the_cell == 'green':
                     self._current_goal_x = self.green_cell_coord[0]
                     self._current_goal_y = self.green_cell_coord[1]
         else:
@@ -787,9 +789,9 @@ class RedGreenCellDetection(Node):
     def _color_direction(self, color: str) -> tuple[str, str]:
         """Vrne smer premika za dano barvo. Red = y, Green = x. Vrne ('x'/'y', 'pos'/'neg')."""
         if color == 'red':
-            return ('y', 'neg')  # Horizontalna črta -> y gibanje
+            return ('x', 'neg')  # Horizontalna črta -> y gibanje
         else:  # green
-            return ('x', 'neg')  # Vertikalna črta -> x gibanje
+            return ('y', 'neg')  # Vertikalna črta -> x gibanje
 
     def _line_visible_in_roi_half(self, image: np.ndarray, color: str, side: str) -> bool:
         """Preveri, ali je črta vidna v izbrani polovici ROI. side='left' ali 'right'."""
@@ -838,11 +840,11 @@ class RedGreenCellDetection(Node):
                 # črta je še vidna na levi -> pošlji naslednji korak
                 axis, _ = self._color_direction(color)
                 if axis == 'y':
-                    next_y = (self._current_goal_y or (self.red_cell_coord[1] if self.red_cell_coord else 0)) - self._step_size
-                    next_x = self._current_goal_x or (self.red_cell_coord[0] if self.red_cell_coord else 0)
+                    next_y = (self._current_goal_y or (self.green_cell_coord[1] if self.green_cell_coord else 0)) - self._step_size
+                    next_x = self._current_goal_x or (self.green_cell_coord[0] if self.green_cell_coord else 0)
                 else:  # 'x'
-                    next_x = (self._current_goal_x or (self.green_cell_coord[0] if self.green_cell_coord else 0)) - self._step_size
-                    next_y = self._current_goal_y or (self.green_cell_coord[1] if self.green_cell_coord else 0)
+                    next_x = (self._current_goal_x or (self.red_cell_coord[0] if self.red_cell_coord else 0)) - self._step_size
+                    next_y = self._current_goal_y or (self.red_cell_coord[1] if self.red_cell_coord else 0)
                 
                 self._current_goal_x = next_x
                 self._current_goal_y = next_y
@@ -854,13 +856,39 @@ class RedGreenCellDetection(Node):
                 self._frames_without_line = 0
 
     def _do_turn_180(self, image: np.ndarray, color: str):
-        """Zavoj za 180°: pošlji Nav2 cilj na isti lokaciji, samo z yaw+180."""
-        if not self.navigation_goal_active:
-            self.get_logger().info('Starting 180° turn via Nav2')
-            yaw_180 = math.pi  # 180°
-            self._send_step_goal(self._current_goal_x, self._current_goal_y, yaw=yaw_180)
+        """In-place 180° rotation using cmd_vel (stateful)."""
+
+        if not hasattr(self, "_turn_180_active"):
+            self.get_logger().info("Starting 180° turn via cmd_vel")
+
+            target = self.current_yaw + math.pi
+            self._turn_180_target = math.atan2(
+                math.sin(target),
+                math.cos(target)
+            )
+
+            self._turn_180_active = True
             self.state = CellState.RETURN_PASS_STEPPING
-            self._frames_without_line = 0
+
+        # ---- CONTINUOUS CONTROL ----
+        err = self._turn_180_target - self.current_yaw
+        err = math.atan2(math.sin(err), math.cos(err))
+
+        twist = TwistStamped()
+        twist.header.stamp = self.get_clock().now().to_msg()
+        twist.header.frame_id = "base_link"
+
+        if abs(err) > 0.05:
+            twist.twist.angular.z = max(-0.8, min(0.8, 2.0 * err))
+            self.cmd_vel_pub.publish(twist)
+            return
+
+        # ---- STOP ----
+        twist.twist.angular.z = 0.0
+        self.cmd_vel_pub.publish(twist)
+
+        self._turn_180_active = False
+        self._frames_without_line = 0
 
     def _do_return_pass_step(self, image: np.ndarray, color: str):
         """Povratni prehod: korak v pozitivni smeri, preverjanje desne polovice ROI."""
