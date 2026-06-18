@@ -14,7 +14,7 @@ from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import TwistStamped
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32
 
 import rclpy
 from rclpy.action import ActionClient
@@ -29,6 +29,10 @@ import cv2
 from sensor_msgs.msg import Image
 
 from std_msgs.msg import String
+
+from geometry_msgs.msg import Point
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker
 
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
@@ -78,6 +82,7 @@ class RobotExplorer(Node):
         self.yellow_ahead = False
         self.obstacle_ahead = False
         self.obstacle_detected = False
+        self.obstacle_nearest_direction = None
 
         self.actively_approaching = False
 
@@ -122,6 +127,7 @@ class RobotExplorer(Node):
         # Subscription for obstacle detection
         self.create_subscription(Bool, '/obstacle/ahead', self._obstacle_ahead_callback, 10)
         self.create_subscription(Bool, '/obstacle/detected', self._obstacle_detected_callback, 10)
+        self.create_subscription(Float32, '/obstacle/nearest_direction_rad', self._obstacle_nearest_direction_callback, 10)
 
         # Something something, approaching a person
         self.create_subscription(Bool, '/approach_active', self._approach_callback, 10)
@@ -130,6 +136,9 @@ class RobotExplorer(Node):
         self.speak_pub = self.create_publisher(String, "/speak", 10)
 
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
+
+        # Publisher for visualizing a grid of markers on RViz
+        self.pub_grid_marker = self.create_publisher(Marker, "/visual_grid", 10)
 
         # Initialisation successful
         self.get_logger().info(f"Robot explorer has been initialized!")
@@ -555,7 +564,7 @@ class RobotExplorer(Node):
 
     # Sequentially visits a set of waypoints on a provided map
     # In area1 of task2, the robot is to avoid crossing the yellow line, so a special method is used
-    def cover_waypoints_area1(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, wait_time: float = 1.0, localise: bool = True) -> None:
+    def cover_waypoints_area1(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, sidestep_distance: float = 0.3, wait_time: float = 1.0, localise: bool = True) -> None:
         for index, (x, y) in enumerate(waypoints):
 
             """
@@ -605,12 +614,32 @@ class RobotExplorer(Node):
             while rclpy.ok():
                 rclpy.spin_once(self, timeout_sec=0.0)
 
-                if self.yellow_ahead and self.is_moving():
-                    self.get_logger().info("Yellow line detected ahead; stopping movement.")
-                    cancel_future = self.goal_handle.cancel_goal_async()
-                    rclpy.spin_until_future_complete(self, cancel_future)
-                    self.turn_odom(math.pi/2, angular_speed=angular_speed)
-                    break
+                # If a yellow line is detected ahead while moving, cancel the current goal
+                #if self.yellow_ahead and self.is_moving():                
+                #    cancel_future = self.goal_handle.cancel_goal_async()
+                #    rclpy.spin_until_future_complete(self, cancel_future)
+                #    self.turn_odom(math.pi/2, angular_speed=angular_speed)
+                #    break
+
+                # If an obstacle is detected, check obstacle_nearest_direction and sidestep accordingly
+                if self.obstacle_detected:
+                    if self.obstacle_nearest_direction is not None:
+                        # Determine a temporary goal position away from the obstacl
+                        sidestep_angle = self.obstacle_nearest_direction + math.pi
+
+                        # Normalise the sidestep angle to be within [-pi, pi]
+                        sidestep_angle = self.normalize_angle(sidestep_angle)
+
+                        self.get_logger().info(f"Obstacle detected, sidestepping at angle {sidestep_angle:.2f} rad")
+
+                        # Turn the robot to face away from the obstacle and move
+                        self.turn_odom(sidestep_angle)
+                        self.move_straight_odom(sidestep_distance)                        
+
+                        # Resume the original goal after reaching the temporary goal
+                        if not self.go_to_pose(x, y, yaw):
+                            self.get_logger().error(f"Failed to resume goal to ({x:.2f}, {y:.2f})")
+                            break
 
                 if self.result_future.done():
                     self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
@@ -827,25 +856,28 @@ class RobotExplorer(Node):
         min_y = min(y1, y2)
         max_y = max(y1, y2)
 
+        # Generate points initially orderd by first largest x, and smallest y
+        # Since the robot is supposed to cover in a lawnmower pattern, every second row is reversed
+        reverse = False
         grid_points = []
-        y = min_y
+        x = max_x
         row_index = 0
-        while y <= max_y:
+        while x >= min_x:
             row_points = []
-            x = min_x
-            while x <= max_x:
+            y = max_y
+            while y >= min_y:
                 row_points.append((x, y))
-                x += step
+                y -= step
 
             if row_index % 2 == 1:
                 row_points.reverse()
 
-            grid_points.extend(row_points)
-            y += step
-            row_index += 1
+            if reverse:
+                row_points.reverse()
 
-        # Reverse the order of the points
-        grid_points.reverse()
+            grid_points.extend(row_points)
+            x -= step
+            row_index += 1
 
         return grid_points
 
@@ -1042,6 +1074,48 @@ class RobotExplorer(Node):
 
     # UTILITY METHODS
 
+    def publish_grid_markers(self, grid_points: list[tuple[float, float]]):
+        if not grid_points:
+            return
+
+        marker = Marker()
+        marker.header.frame_id = "map" 
+        
+        # 1. Clear out the timestamp completely so it forces RViz to render it immediately
+        marker.header.stamp = rclpy.time.Time().to_msg() 
+        
+        marker.ns = "lawnmower_grid"
+        marker.id = 0
+        marker.action = Marker.ADD
+        marker.type = Marker.LINE_STRIP 
+        
+        # 2. VITAL FIX: Explicitly zero out the base pose & orientation
+        # If these are uninitialized, RViz cannot calculate where the lines start
+        marker.pose.position.x = 0.0
+        marker.pose.position.y = 0.0
+        marker.pose.position.z = 0.0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0  # Must be 1.0 for valid quaternion geometry!
+
+        # 3. Scale handling
+        marker.scale.x = 0.1 # Width of your path lines in meters
+
+        # Color: Bright Green
+        marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+
+        # Loop through your generated grid and convert them to ROS Points
+        for pt in grid_points:
+            ros_point = Point()
+            ros_point.x = pt[0]
+            ros_point.y = pt[1]
+            ros_point.z = 0.0 
+            marker.points.append(ros_point)
+
+        # Publish it out!
+        self.pub_grid_marker.publish(marker)
+
     # Waits for the current navigation task to complete, with a timeout, and returns whether it succeeded
     def wait_task_done(self, timeout_sec: float = 120.0) -> bool:
         start = self.get_clock().now()
@@ -1125,6 +1199,12 @@ class RobotExplorer(Node):
             self.obstacle_detected = bool(msg.data)
         except Exception:
             self.get_logger().warn('Received malformed /obstacle/detected message')
+
+    def _obstacle_nearest_direction_callback(self, msg: Float32) -> None:
+        try:
+            self.obstacle_nearest_direction = float(msg.data)
+        except Exception:
+            self.get_logger().warn('Received malformed /obstacle/nearest_direction message')
 
     def _image_callback(self, msg: Image) -> None:
         try:
@@ -1215,8 +1295,8 @@ def main(args = None):
     #re.localise_self()
 
     # hardcoded waypoints for the specific map
-    area1_lower_bound = (-4.075931584273279, -0.32869288263557733)
-    area1_upper_bound = (0.5012251325539632, -4.484576582824663)
+    area1_lower_bound = (-4.625164799871704, 0.3657965954308261)
+    area1_upper_bound = (0.5791560549165018, -5.072113041813735)
     blue_line_start = (2.797641390882936, 0.19569027139125528)
 
     behind_boundary_test_point = (0.07849085761053862, -2.013457906741135)
@@ -1265,8 +1345,9 @@ def main(args = None):
                     (-2.9796109425001718, -1.0694166887545653),
                     (-3.26013179610062, -1.1159374308024788)]
 
-    #waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=1.3)
-    #print(f"Generated {len(waypoints_task2_sim_area1)} waypoints for area 1")
+    waypoints_task2_sim_area1 = re.generate_grid(area1_upper_bound, area1_lower_bound, step=0.8)
+    re.publish_grid_markers(waypoints_task2_sim_area1)
+    print(f"Generated {len(waypoints_task2_sim_area1)} waypoints for area 1")
 
     # Turn right
     #re.turn_odom(-math.pi/2, angular_speed=0.5)
@@ -1275,9 +1356,9 @@ def main(args = None):
     # TASK 2
     # For line detection run detect_yellow_line.py and arm_mover_actions.py
     # For best view of both the yellow and blue line
-    #re.cover_waypoints_area1(waypoints_task2_sim_area1, localise=False)
+    re.cover_waypoints_area1(waypoints_task2_sim_area1, localise=False)
 
-    re.cover_waypoints(waypoints_task2_sim_area1, localise=False)
+    #re.cover_waypoints(waypoints_task2_sim_area1, localise=False)
 
     re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
 
