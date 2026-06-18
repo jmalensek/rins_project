@@ -145,6 +145,8 @@ class RobotExplorer(Node):
 
         self.arm_mover_pub = self.create_publisher(String, '/arm_command', 10)
 
+        self.finish_pub = self.create_publisher(Bool, '/finished', 10)
+
         # Change from create_client to ActionClient
         self.compute_path_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
 
@@ -1694,6 +1696,11 @@ def main(args = None):
     re.cover_waypoints_area1_optimized(waypoints_task2_sim_area1, localise=False)
 
     #re.cover_waypoints_basic(waypoints_task2_sim_area1, localise=False)
+
+    # Publish /finished message to indicate that the exploration is complete
+    finished_msg = Bool()
+    finished_msg.data = True
+    re.finished_pub.publish(finished_msg)
 
     re.follow_blue_line_routine(blue_line_start, start_yaw=blue_line_start_quaternion_yaw, sidestep_distance=0.3, angular_speed=0.5)
 
