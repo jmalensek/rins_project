@@ -62,6 +62,7 @@ class CellState(Enum):
     IDLE = auto()
     WAITING_FOR_COLOR = auto()
     MOVING_TO_CELL = auto()
+    ROTATING_90_RIGHT = auto()
     FIRST_PASS_STEPPING = auto()
     TURNING_180 = auto()
     RETURN_PASS_STEPPING = auto()
@@ -657,10 +658,10 @@ class RedGreenCellDetection(Node):
 
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Navigation step succeeded')
-            # Transition from MOVING_TO_CELL -> FIRST_PASS_STEPPING
+            # Transition from MOVING_TO_CELL -> ROTATING_90_RIGHT
             if self.state == CellState.MOVING_TO_CELL:
-                self.get_logger().info('Reached initial cell area. State -> FIRST_PASS_STEPPING')
-                self.state = CellState.FIRST_PASS_STEPPING
+                self.get_logger().info('Reached initial cell area. State -> ROTATING_90_RIGHT')
+                self.state = CellState.ROTATING_90_RIGHT
                 # Initialize goal coordinates from target cell
                 if self.red_cell_coord and self.color_of_the_cell == 'red':
                     self._current_goal_x = self.red_cell_coord[0]
@@ -789,8 +790,10 @@ class RedGreenCellDetection(Node):
             return
 
         if self.state == CellState.MOVING_TO_CELL:
-            # Čakamo, da Nav2 doseže ciljno lokacijo, nato preide v prvi prehod
+            # Čakamo, da Nav2 doseže ciljno lokacijo, nato preide v rotacijo
             return
+        elif self.state == CellState.ROTATING_90_RIGHT:
+            self._do_rotate_90_right(image, color)
         elif self.state == CellState.FIRST_PASS_STEPPING:
             self._do_first_pass_step(image, color)
         elif self.state == CellState.TURNING_180:
@@ -845,6 +848,39 @@ class RedGreenCellDetection(Node):
         
         send_goal_future = self.nav_to_pose_client.send_goal_async(goal_msg)
         send_goal_future.add_done_callback(self.nav_goal_response_callback)
+
+    def _do_rotate_90_right(self, image: np.ndarray, color: str):
+        """In-place 90° right rotation using cmd_vel (stateful)."""
+        if not hasattr(self, "_rotate_90_active"):
+            self.get_logger().info("Starting 90° right turn via cmd_vel")
+            target = self.current_yaw - math.pi / 2.0  # 90° to the right (negative)
+            self._rotate_90_target = math.atan2(
+                math.sin(target),
+                math.cos(target)
+            )
+            self._rotate_90_active = True
+
+        # ---- CONTINUOUS CONTROL ----
+        err = self._rotate_90_target - self.current_yaw
+        err = math.atan2(math.sin(err), math.cos(err))
+
+        twist = TwistStamped()
+        twist.header.stamp = self.get_clock().now().to_msg()
+        twist.header.frame_id = "base_link"
+
+        if abs(err) > 0.05:
+            twist.twist.angular.z = max(-0.8, min(0.8, 2.0 * err))
+            self.cmd_vel_pub.publish(twist)
+            return
+
+        # ---- STOP ----
+        twist.twist.angular.z = 0.0
+        self.cmd_vel_pub.publish(twist)
+
+        self._rotate_90_active = False
+        self._frames_without_line = 0
+        self.get_logger().info('90° right rotation complete. State -> FIRST_PASS_STEPPING')
+        self.state = CellState.FIRST_PASS_STEPPING
 
     def _do_first_pass_step(self, image: np.ndarray, color: str):
         """Prvi prehod: korak v negativni smeri, preverjanje leve polovice ROI."""
@@ -978,8 +1014,8 @@ class RedGreenCellDetection(Node):
         self.search_active = False
         self._frames_without_line = 0
         self.state = CellState.IDLE
-        self._turn_start_time = None
-        self._turn_target_duration = None
+        self._rotate_90_active = False
+        self._turn_180_active = False
         self.get_logger().info('Internal state reset')
 
 
