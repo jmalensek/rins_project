@@ -1027,6 +1027,74 @@ class RobotExplorer(Node):
             publish_cmd(v, angular)
             time.sleep(loop_dt)
 
+    # Full routine for following the blue line - Traverse to the start of the line, avoiding obstacles and the yellow line, then follow the line until the end
+    def follow_blue_line_routine(
+            self, line_start: tuple[float, float], 
+            start_yaw: float = 0.0,
+            sidestep_distance: float = 0.3,
+            angular_speed: float = 0.5
+            ) -> None:
+        
+        self.get_logger().info("Starting full routine to follow the blue line...")
+
+        # First navigate to the start of the line while avoiding obstacles and the yellow line
+        self.get_logger().info(f"Navigating to the start of the line at ({line_start[0]:.2f}, {line_start[1]:.2f})...")
+
+        if not self.go_to_pose(line_start[0], line_start[1], start_yaw):
+            self.get_logger().error(f"Failed to navigate to the start of the line at ({line_start[0]:.2f}, {line_start[1]:.2f})")
+            return
+        
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.0)
+            # If a yellow line is detected ahead while moving, cancel the current goal
+            if self.yellow_ahead and self.is_moving():  
+                # Temporarily cancel the current goal to turn away from the yellow line              
+                if self.goal_handle is not None:
+                    cancel_future = self.goal_handle.cancel_goal_async()
+                    rclpy.spin_until_future_complete(self, cancel_future)
+
+                self.turn_odom(math.pi/2, angular_speed=angular_speed)
+                    
+                # Sidestep a bit to try to get around the yellow line
+                self.move_straight_odom(sidestep_distance)
+
+                # Resume the original goal after sidestepping
+                if not self.go_to_pose(x, y, yaw=0.0):
+                    self.get_logger().error(f"Failed to resume goal to ({x:.2f}, {y:.2f})")
+                    break
+
+            # If an obstacle is detected, check obstacle_nearest_direction and sidestep accordingly
+            if self.obstacle_detected:
+                if self.obstacle_nearest_direction is not None:
+                    # Temporarily cancel the current goal to sidestep around the obstacle
+                    if self.goal_handle is not None:
+                        cancel_future = self.goal_handle.cancel_goal_async()
+                        rclpy.spin_until_future_complete(self, cancel_future)
+
+                    # Determine a temporary goal position away from the obstacle
+                    sidestep_angle = self.obstacle_nearest_direction + math.pi
+
+                    # Normalise the sidestep angle to be within [-pi, pi]
+                    sidestep_angle = self.normalize_angle(sidestep_angle)
+
+                    self.get_logger().info(f"Obstacle detected, sidestepping at angle {sidestep_angle:.2f} rad")
+
+                    # Turn the robot to face away from the obstacle and move
+                    self.turn_odom(sidestep_angle)
+                    self.move_straight_odom(sidestep_distance)                        
+
+                    # Resume the original goal after reaching the temporary goal
+                    if not self.go_to_pose(x, y, yaw=0.0):
+                        self.get_logger().error(f"Failed to resume goal to ({x:.2f}, {y:.2f})")
+                        break
+
+            if self.result_future.done():
+                self.get_logger().info(f"Successfully reached ({x:.2f}, {y:.2f})")
+                break
+
+        # Then follow the blue line until the end
+        self.follow_blue_line()
+
     # NAVIGATION HELPER METHODS
 
     # Makes a grid of points using two opposing corner bounds
@@ -1608,9 +1676,7 @@ def main(args = None):
 
     #re.cover_waypoints_basic(waypoints_task2_sim_area1, localise=False)
 
-    re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
-
-    re.follow_blue_line()
+    re.follow_blue_line_routine(blue_line_start, start_yaw=blue_line_start_quaternion_yaw, sidestep_distance=0.3, angular_speed=0.5)
 
     # TASK 1R
     #re.cover_waypoints_basic(waypoints_irl, wait_time=0.5, localise=True)
