@@ -50,7 +50,7 @@ class detect_rings(Node):
         self.rgb_image_sub = self.create_subscription(Image, "/oakd/rgb/preview/image_raw", self.rgb_callback, qos_profile_sensor_data)
         self.pointcloud_sub = self.create_subscription(PointCloud2, "/oakd/rgb/preview/depth/points", self.pointcloud_callback, qos_profile_sensor_data)
 
-        self.report_ring_pub = self.create_publisher(RingsResults, "/rings_results rins_interfaces/msg/RingsResults", 10)
+        self.report_ring_pub = self.create_publisher(RingsResults, "/rings_results", 10)
 
         self.marker_pub = self.create_publisher(Marker, marker_topic, QoSReliabilityPolicy.RELIABLE)
 
