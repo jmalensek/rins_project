@@ -942,6 +942,13 @@ class RobotExplorer(Node):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.0)
 
+            # Some new active approach interruption mechanism, that I don't fully understand
+            while self.actively_approaching:
+                self.get_logger().info("Active approach in progress, waiting...")
+
+                # Wait a short while before checking again
+                rclpy.spin_once(self, timeout_sec=0.1)
+
             img = self._last_bgr
             if img is None:
                 time.sleep(loop_dt)
