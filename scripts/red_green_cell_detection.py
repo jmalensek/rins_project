@@ -39,6 +39,13 @@ import tf2_ros
 from tf2_ros import TransformException
 from tf2_geometry_msgs import do_transform_point
 
+from rclpy.action import ActionClient
+
+from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import PoseStamped
+
+from action_msgs.msg import GoalStatus
+
 
 class CellState(Enum):
     IDLE = auto()
@@ -92,6 +99,14 @@ class RedGreenCellDetection(Node):
         self.follow_max_angular_speed = self.get_parameter('follow_max_angular_speed').get_parameter_value().double_value
         self.turn_180_angular_speed = self.get_parameter('turn_180_angular_speed').get_parameter_value().double_value
         self.alignment_tolerance_deg = self.get_parameter('alignment_tolerance_deg').get_parameter_value().double_value
+
+        self.nav_to_pose_client = ActionClient(
+            self,
+            NavigateToPose,
+            'navigate_to_pose'
+        )
+
+        self.navigation_goal_active = False
 
         # po pridobitvi pointcloud-a se to spremeni v map-frame (x, y, z) tocko,
         # ne vec pixel (cx, cy) - glej pixel_to_map_coords / pointcloud_callback
@@ -197,21 +212,6 @@ class RedGreenCellDetection(Node):
                 return True
         return False
 
-    def classify_lab(self, L, A, B):
-        # OpenCV vraca A,B kanala v razponu 0-255 z nevtralno tocko pri 128
-        # (ne 0!). Treba jih je centrirati, drugace je chroma/hue popacen.
-        A = A - 128.0
-        B = B - 128.0
-        chroma = np.sqrt(A ** 2 + B ** 2)
-        if chroma < 15:
-            return "other"
-        hue = np.degrees(np.arctan2(B, A)) % 360
-        if hue < 42 or hue >= 330:
-            return "red"
-        elif 75 <= hue < 100:
-            return "green"
-        else:
-            return "other"
 
     def detect_line_of_color(self, image: np.ndarray, color: str) -> tuple[int, int] | None:
         """
@@ -232,6 +232,9 @@ class RedGreenCellDetection(Node):
         floor_band_height = 80
         roi = image[h-floor_band_height:h, :]
 
+        #cv2.imshow(f'line', roi)
+        #cv2.waitKey(1)
+
         # Convert ROI to LAB
         lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
         L = lab[:, :, 0]
@@ -247,7 +250,7 @@ class RedGreenCellDetection(Node):
         if color == 'red':
             mask = (chroma >= 15) & ((hue < 42) | (hue >= 330))
         elif color == 'green':
-            mask = (chroma >= 15) & (hue >= 75) & (hue < 120)
+            mask = (chroma >= 15) & (hue >= 105) & (hue < 140)
         else:
             return None
 
@@ -272,6 +275,10 @@ class RedGreenCellDetection(Node):
         # Reject objects that are not line-like
         x, y, w_box, h_box = cv2.boundingRect(largest)
 
+        # Convert contour bounding box from ROI coordinates to full-image coordinates
+        y_full = y + (h - floor_band_height)
+
+
         aspect_ratio = w_box / h_box
 
         if aspect_ratio < 2:
@@ -291,6 +298,39 @@ class RedGreenCellDetection(Node):
 
         # Convert back to image coordinates
         cy = cy_roi + (h - floor_band_height)
+
+
+        # Build color mask for the entire image
+        lab_full = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+        A_full = lab_full[:, :, 1] - 128.0
+        B_full = lab_full[:, :, 2] - 128.0
+
+        chroma_full = np.sqrt(A_full**2 + B_full**2)
+        hue_full = np.degrees(np.arctan2(B_full, A_full)) % 360
+
+        if color == 'red':
+            full_mask = (chroma_full >= 15) & ((hue_full < 42) | (hue_full >= 330))
+        else:  # green
+            full_mask = (chroma_full >= 15) & (hue_full >= 105) & (hue_full < 140)
+
+        full_mask = full_mask.astype(np.uint8) * 255
+
+        upper_region = full_mask[:h-floor_band_height, :]
+
+        contours_upper, _ = cv2.findContours(
+            upper_region,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        for cnt in contours_upper:
+            if cv2.contourArea(cnt) > self.min_contour_area:
+                self.get_logger().info(
+                    f"Rejected {color} line because significant {color} region "
+                    f"exists above ROI"
+                )
+                return None
 
         self.get_logger().info(
             f"Detected {color} line at ({cx}, {cy}) "
@@ -321,7 +361,7 @@ class RedGreenCellDetection(Node):
         h, w = image.shape[:2]
 
         floor_band_height = 80
-        roi = image[h - floor_band_height:h, :]
+        roi = image[h - floor_band_height:h, 0:w//2]
 
         lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
         A = lab[:, :, 1] - 128.0
@@ -462,11 +502,165 @@ class RedGreenCellDetection(Node):
         )
 
         return (x, y, z)
+    
+    def get_offset_goal(self, target_x, target_y, offset=0.6):
 
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                'map',
+                'base_link',
+                rclpy.time.Time()
+            )
+
+            robot_x = tf.transform.translation.x
+            robot_y = tf.transform.translation.y
+
+        except TransformException as exc:
+            self.get_logger().warning(
+                f'Failed getting robot pose: {exc}'
+            )
+            return target_x, target_y
+
+        dx = target_x - robot_x
+        dy = target_y - robot_y
+
+        dist = math.hypot(dx, dy)
+
+        if dist < 0.05:
+            return target_x, target_y
+
+        goal_x = target_x - offset * dx / dist
+        goal_y = target_y - offset * dy / dist
+
+        return goal_x, goal_y
+    
+    def get_target_coordinate(self):
+        if self.color_of_the_cell == 'red':
+            return self.red_cell_coord
+
+        if self.color_of_the_cell == 'green':
+            return self.green_cell_coord
+
+        return None
+    
+    def send_navigation_goal(self):
+
+        target = self.get_target_coordinate()
+
+        if target is None:
+            self.get_logger().warning(
+                'No target coordinate available'
+            )
+            return
+
+        target_x, target_y, _ = target
+
+        if not self.nav_to_pose_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().error(
+                'NavigateToPose action server not available'
+            )
+            return
+
+        
+        goal_msg = NavigateToPose.Goal()
+
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+
+        goal_x, goal_y = self.get_offset_goal(
+            target_x,
+            target_y,
+            offset=0.60
+        )
+
+        goal_msg.pose.pose.position.x = target_x
+        goal_msg.pose.pose.position.y = target_y
+        goal_msg.pose.pose.position.z = 0.0
+
+        #
+        # Orientation:
+        #
+
+        yaw = math.atan2(
+            target_y - goal_y,
+            target_x - goal_x
+        )
+        goal_msg.pose.pose.orientation.x = 0.0
+        goal_msg.pose.pose.orientation.y = 0.0
+        goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+
+        self.get_logger().info(
+            f'Sending Nav2 goal ({target_x:.2f}, {target_y:.2f})'
+        )
+
+        self.navigation_goal_active = True
+
+        send_goal_future = self.nav_to_pose_client.send_goal_async(
+            goal_msg
+        )
+
+        send_goal_future.add_done_callback(
+            self.nav_goal_response_callback
+        )
+
+    def nav_goal_response_callback(self, future):
+
+        goal_handle = future.result()
+
+        if not goal_handle.accepted:
+            self.get_logger().error(
+                'Navigation goal rejected'
+            )
+
+            self.navigation_goal_active = False
+            self.state = CellState.IDLE
+            return
+
+        self.get_logger().info(
+            'Navigation goal accepted'
+        )
+
+        result_future = goal_handle.get_result_async()
+
+        result_future.add_done_callback(
+            self.nav_result_callback
+        )
+
+    def nav_result_callback(self, future):
+
+        self.navigation_goal_active = False
+
+        result = future.result()
+
+        status = result.status
+
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info(
+                'Navigation succeeded'
+            )
+
+            self.state = CellState.ALIGNING
+
+        else:
+            self.get_logger().error(
+                f'Navigation failed with status {status}'
+            )
+
+            self.state = CellState.IDLE
     def camera_callback(self, msg: Image):
         """Handle incoming camera frames."""
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+            h, w = cv_image.shape[:2]
+
+            # Only look at the bottom part of the image
+            floor_band_height = 80
+            roi = cv_image[h-floor_band_height:h, :]
+            cv2.imshow(f'line', roi)
+            cv2.waitKey(1)
+
         except CvBridgeError as exc:
             self.get_logger().error(f'CV Bridge error: {exc}')
             return
@@ -549,6 +743,7 @@ class RedGreenCellDetection(Node):
             return
         self._frames_without_line = 0
         self.state = CellState.MOVING_TO_CELL
+        self.send_navigation_goal()
         self.get_logger().info('State -> MOVING_TO_CELL')
 
     def step_state_machine(self, image: np.ndarray):
@@ -561,7 +756,7 @@ class RedGreenCellDetection(Node):
             return
 
         if self.state == CellState.MOVING_TO_CELL:
-            self._do_moving_to_cell(image, color)
+            return
         elif self.state == CellState.ALIGNING:
             self._do_aligning(image, color)
         elif self.state == CellState.FOLLOWING_TO_FAR_END:
@@ -616,7 +811,7 @@ class RedGreenCellDetection(Node):
             # naprej v isto smer, lahko spet pride v kader
             self._publish_cmd(0.0, -self.align_angular_speed)
             self._frames_without_line += 1
-            if self._frames_without_line > self.line_lost_threshold * 3:
+            if self._frames_without_line > self.line_lost_threshold * 25:
                 self.get_logger().warning(
                     'Lost line for too long while aligning, stopping as a precaution.'
                 )
