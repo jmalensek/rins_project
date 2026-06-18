@@ -56,6 +56,10 @@ class detect_faces(Node):
 
 		self.bridge = CvBridge()
 
+		# na koncu ne gre do CEO
+		self.approach = True
+		self.yellow_room_pub = self.create_subscription(Bool, "/finished", self.finished_callback, 10)
+
 		# cache latest pointcloud as numpy (height, width, 3) in base_link frame
 		self.latest_pc = None
 		self.latest_pc_header = None
@@ -116,6 +120,11 @@ class detect_faces(Node):
 
 		model_path = os.path.join(self.package_share_dir, MODEL_PATH)
 		self.model = YOLO(model_path)
+
+
+	# yellow room finished
+	def finished_callback(self, msg):
+		self.approach = False
 
 	def _expand_bbox_for_draw(self, bbox, image_shape):
 		x1, y1, x2, y2 = bbox
@@ -542,6 +551,8 @@ class detect_faces(Node):
 			self._pending_track = None
 
 	def pointcloud_callback(self, data):
+		if self.approach == False:
+			return
 		if self.latest_image is None or self.recognizer is None:
 			return
 		if not self.faces:
