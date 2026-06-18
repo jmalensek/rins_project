@@ -661,7 +661,7 @@ class RobotExplorer(Node):
                                         angular_speed: float = 0.5, 
                                         sidestep_distance: float = 0.3, 
                                         wait_time: float = 1.0,
-                                        point_timeout_sec: float = 15.0,
+                                        point_timeout_sec: float = 25.0,
                                         localise: bool = True
                                         ) -> None:
         
@@ -742,6 +742,9 @@ class RobotExplorer(Node):
             best_cost = float('inf')
             for point in unvisited_waypoints:
                 cost = self.compute_nav_cost((x, y), point)
+                if cost is None:
+                    continue
+
                 if cost < best_cost:
                     best_cost = cost
                     next_point = point
@@ -1498,8 +1501,6 @@ def main(args = None):
     area1_upper_bound = (0.5791560549165018, -5.072113041813735)
     blue_line_start = (2.797641390882936, 0.19569027139125528)
 
-    behind_boundary_test_point = (0.07849085761053862, -2.013457906741135)
-
     blue_line_start_quaternion_yaw = re.quaternion_to_yaw(Quaternion(x=-0.0, y=0.0, z=0.707, w=0.707))
 
     waypoints_task1_sim = [
@@ -1555,11 +1556,12 @@ def main(args = None):
     # TASK 2
     # For line detection run detect_yellow_line.py and arm_mover_actions.py
     # For best view of both the yellow and blue line
+    waypoints_task2_sim_area1.append(blue_line_start)
     re.cover_waypoints_area1_optimized(waypoints_task2_sim_area1, localise=False)
 
     #re.cover_waypoints_basic(waypoints_task2_sim_area1, localise=False)
 
-    re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
+    #re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
 
     re.follow_blue_line()
 
