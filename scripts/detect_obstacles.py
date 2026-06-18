@@ -7,7 +7,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32
 
 
 class ObstacleDetector(Node):
@@ -17,7 +17,7 @@ class ObstacleDetector(Node):
         # Parameters
         self.declare_parameter("scan_topic", "/scan")
         self.declare_parameter("obstacle_detected_distance_threshold", 0.25)
-        self.declare_parameter("obstacle_ahead_distance_threshold", 0.5)
+        self.declare_parameter("obstacle_ahead_distance_threshold", 0.45)
         self.declare_parameter("window_size", 50)
 
         self.scan_topic = self.get_parameter("scan_topic").value
@@ -40,35 +40,42 @@ class ObstacleDetector(Node):
 
         self.pub_detected = self.create_publisher(Bool, "/obstacle/detected", 10)
         self.pub_ahead = self.create_publisher(Bool, "/obstacle/ahead", 10)
+        self.pub_nearest_direction = self.create_publisher(Float32, "/obstacle/nearest_direction_rad", 10)
 
         self.get_logger().info(f"Obstacle detector started. Subscribing to {self.scan_topic}")
 
     def _scan_callback(self, msg: LaserScan):
-        ranges = np.array(msg.ranges, dtype=np.float32)
-        ranges = ranges[np.isfinite(ranges)]
+        # 1. Keep the raw ranges array intact so indices map perfectly to angles
+        raw_ranges = np.array(msg.ranges, dtype=np.float32)
 
-        if len(ranges) == 0:
+        # 2. Create a masked version where inf/nan are replaced with infinity 
+        # This keeps the array the exact same size, but ignores bad readings for np.argmin
+        clean_ranges = np.where(np.isfinite(raw_ranges), raw_ranges, np.inf)
+
+        # Quick safety check: if everything is inf/nan, skip
+        if np.all(clean_ranges == np.inf):
             return
 
-        # Take center window (front of robot), 1/4 of the scan range I guess
+        # 3. Handle the front window safely using the original indices
         mid = len(msg.ranges) // 4
-
         start = max(0, mid - self.window_size)
         end = min(len(msg.ranges), mid + self.window_size)
+        
+        front_ranges = clean_ranges[start:end]
+        min_dist_front = np.min(front_ranges)
 
-        front_ranges = np.array(msg.ranges[start:end], dtype=np.float32)
-        front_ranges = front_ranges[np.isfinite(front_ranges)]
+        # 4. Get the minimum distance and its exact ORIGINAL index
+        min_all_index = np.argmin(clean_ranges)
+        min_dist_all = clean_ranges[min_all_index]
 
-        if len(front_ranges) == 0:
-            return
+        # 5. Compute the angle of the nearest obstacle relative to the front (mid)
+        # Difference in indices * angle step size
+        nearest_angle = (min_all_index - mid) * msg.angle_increment
 
-        min_dist = np.min(front_ranges)
-        min_dist_all = np.min(ranges)
-
-        obstacle_ahead = min_dist < self.ahead_threshold
+        # --- The rest of your publishing code ---
+        obstacle_ahead = min_dist_front < self.ahead_threshold
         obstacle_detected = min_dist_all < self.detected_threshold
 
-        # Publish
         msg_ahead = Bool()
         msg_ahead.data = bool(obstacle_ahead)
         self.pub_ahead.publish(msg_ahead)
@@ -77,12 +84,19 @@ class ObstacleDetector(Node):
         msg_detected.data = bool(obstacle_detected)
         self.pub_detected.publish(msg_detected)
 
+        # Publish the direction of the nearest obstacle
+        msg_direction = Float32()
+        msg_direction.data = float(nearest_angle)
+        self.pub_nearest_direction.publish(msg_direction)
+
         # Optional logging (avoid spam)
         if obstacle_ahead:
-            self.get_logger().warn(f"Obstacle ahead; distance={min_dist:.2f} m")
+            #self.get_logger().warn(f"Obstacle ahead; distance={min_dist_front:.2f} m")
+            pass
 
         if obstacle_detected:
-            self.get_logger().warn(f"Obstacle detected; min distance={min_dist_all:.2f} m")
+            #self.get_logger().warn(f"Obstacle detected; min distance={min_dist_all:.2f} m at angle {math.degrees(nearest_angle):.1f} deg")
+            pass
 
 
 def main(args=None):
