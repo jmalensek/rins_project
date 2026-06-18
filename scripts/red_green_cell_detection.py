@@ -67,9 +67,9 @@ class RedGreenCellDetection(Node):
         self.tile_detection_stop_topic = self.get_parameter('tile_detection_stop_topic').get_parameter_value().string_value
 
         # Inicializacija Robot Commanderja
-        self.commander = RobotCommander(self)
+        #self.commander = RobotCommander(self)
 
-        self.explo = RobotExplorer(self)
+        self.explo = RobotExplorer()
 
         # Interno stanje
         self.task_active = False
@@ -141,8 +141,10 @@ class RedGreenCellDetection(Node):
             
             for cell in self.COORDINATES:
 
-                start_coords = cell['start']
-                end_coords = cell['end']
+                rclpy.spin_once(self, timeout_sec=0.1)
+
+                start_coords = self.COORDINATES[cell].get('start')
+                end_coords = self.COORDINATES[cell].get('end')
 
                 # 1. Premik do začetne točke celice
                 self.get_logger().info(f"Potujem proti ZAČETKU celice: {start_coords}")
@@ -150,7 +152,9 @@ class RedGreenCellDetection(Node):
 
                 ayaw = self.explo.compute_absolute_yaw(start_coords, end_coords)
 
-                self.explo.go_to_pose(start_coords[0], start_coords[1], ayaw)
+                if not self.explo.go_to_pose(start_coords[0], start_coords[1], ayaw):
+                    self.get_logger().error(f"Neuspešen premik do začetka celice: {start_coords}. Prekinjam misijo.")
+                    return
 
                 distance = self.explo.compute_distance(start_coords, end_coords)
 
@@ -207,7 +211,7 @@ class RedGreenCellDetection(Node):
         self.get_logger().info(f"Zaznanih pikslov barve '{expected_color}': {pixel_count}")
         
         # Prag za potrditev (če je vsaj 500 slikovnih pik ustrezne barve)
-        return pixel_count > 500
+        return pixel_count > 15
 
     def raise_top_camera(self):
         command = 'look_at_belt_right'
@@ -241,6 +245,7 @@ def main():
     node = RedGreenCellDetection()
     executor = MultiThreadedExecutor()
     executor.add_node(node)
+    executor.add_node(node.explo)
 
     try:
         executor.spin()
