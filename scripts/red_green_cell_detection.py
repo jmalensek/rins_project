@@ -361,7 +361,7 @@ class RedGreenCellDetection(Node):
         h, w = image.shape[:2]
 
         floor_band_height = 80
-        roi = image[h - floor_band_height:h, 0:w//2]
+        roi = image[h - floor_band_height:h, :]
 
         lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
         A = lab[:, :, 1] - 128.0
@@ -400,32 +400,34 @@ class RedGreenCellDetection(Node):
         cy_roi = int(M['m01'] / M['m00'])
         cy = cy_roi + (h - floor_band_height)
 
-        rect = cv2.minAreaRect(largest)
-        (rect_w, rect_h) = rect[1]
-        raw_angle = rect[2]
-
-        # Normaliziramo tako, da 0 deg pomeni "glavna os je navpicna v sliki".
-        if rect_w < rect_h:
-            angle_from_vertical = raw_angle
-        else:
-            angle_from_vertical = raw_angle + 90.0
-
-        if angle_from_vertical > 90:
-            angle_from_vertical -= 180
-        elif angle_from_vertical < -90:
-            angle_from_vertical += 180
 
         offset_x = cx - (w / 2.0)
 
-        self.get_logger().debug(
-            f"[nav] {color} blob at ({cx},{cy}) area={area:.0f} "
-            f"angle_from_vertical={angle_from_vertical:.1f} offset_x={offset_x:.1f}"
+
+        # PCA orientacija konture
+        pts = largest.reshape(-1, 2).astype(np.float32)
+
+        mean, eigenvectors, eigenvalues = cv2.PCACompute2(
+            pts,
+            mean=None
         )
 
+        # glavna os konture
+        vx, vy = eigenvectors[0]
+
+        # kot glavne osi glede na vodoravnico
+        line_angle = np.degrees(np.arctan2(vy, vx))
+
+        # normalizacija na [-90, 90]
+        if line_angle > 90:
+            line_angle -= 180
+        elif line_angle < -90:
+            line_angle += 180
         return {
             'center': (cx, cy),
-            'angle_deg': angle_from_vertical,
+            'angle_deg': line_angle,
             'offset_x': offset_x,
+            'direction': (float(vx), float(vy)),
         }
 
     def pointcloud_callback(self, data: PointCloud2):
@@ -706,8 +708,8 @@ class RedGreenCellDetection(Node):
                 self.red_cell_coord = map_coord
                 self._pending_red_pixel = None
                 self.get_logger().info(f'Red cell map coordinate saved: {map_coord}')
-                if self.task_active and self.state == CellState.IDLE:
-                    self.begin_cell_approach()
+                #if self.task_active and self.state == CellState.IDLE:
+                    #self.begin_cell_approach()
 
         if self._pending_green_pixel is not None:
             cx, cy = self._pending_green_pixel
@@ -716,8 +718,8 @@ class RedGreenCellDetection(Node):
                 self.green_cell_coord = map_coord
                 self._pending_green_pixel = None
                 self.get_logger().info(f'Green cell map coordinate saved: {map_coord}')
-                if self.task_active and self.state == CellState.IDLE:
-                    self.begin_cell_approach()
+                #if self.task_active and self.state == CellState.IDLE:
+                    #self.begin_cell_approach()
 
     def on_task_started(self, msg: Bool):
         """ROS callback, ko task manager signalizira začetek taska."""
@@ -727,10 +729,11 @@ class RedGreenCellDetection(Node):
         self.task_active = True
         self.get_logger().info('Task started signal received')
 
-        if self._has_coordinates():
-            self.begin_cell_approach()
-        else:
-            self.get_logger().info('Waiting for line coordinates before starting approach...')
+        while not self._has_coordinates():
+            self.get_logger().info('Waiting for line coordinates to be detected...')
+            time.sleep(0.5)
+        self.begin_cell_approach()
+
 
     # ------------------------------------------------------------------
     # State machine
