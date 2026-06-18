@@ -60,6 +60,7 @@ from nav_msgs.msg import Odometry
 
 class CellState(Enum):
     IDLE = auto()
+    WAITING_FOR_COLOR = auto()
     MOVING_TO_CELL = auto()
     FIRST_PASS_STEPPING = auto()
     TURNING_180 = auto()
@@ -234,6 +235,12 @@ class RedGreenCellDetection(Node):
         self.get_logger().info(
             f"Color of the cell received: {self.color_of_the_cell}"
         )
+        if self.task_active and self.state == CellState.WAITING_FOR_COLOR:
+            if self._has_coordinates():
+                self.get_logger().info('Color received and coordinates present; starting approach.')
+                self.begin_cell_approach()
+            else:
+                self.get_logger().info('Color received; still waiting for line coordinates before starting.')
 
     def _active_color(self) -> str | None:
         """Vrne barvo, ki jo trenutno štejemo za 'aktivno' linijo za ta task."""
@@ -683,7 +690,7 @@ class RedGreenCellDetection(Node):
 
         # pasivno zaznavanje - vedno, ne glede na task, dokler nismo aktivno
         # v sredini manevra (da ne shranjujemo koordinat med samim izvajanjem)
-        if self.state in (CellState.IDLE,):
+        if self.state in (CellState.IDLE, CellState.WAITING_FOR_COLOR):
             self.process_frame(cv_image)
 
         # state machine korak - en korak na frame, nikoli blokirajoče
@@ -743,9 +750,16 @@ class RedGreenCellDetection(Node):
         self.task_active = True
         self.get_logger().info('Task started signal received')
 
-        while not self._has_coordinates():
-            self.get_logger().info('Waiting for line coordinates to be detected...')
-            time.sleep(0.5)
+        if self.color_of_the_cell is None:
+            self.state = CellState.WAITING_FOR_COLOR
+            self.get_logger().info('Waiting for color signal before starting approach...')
+            return
+
+        if not self._has_coordinates():
+            self.state = CellState.WAITING_FOR_COLOR
+            self.get_logger().info('Color known, waiting for line coordinates before starting approach...')
+            return
+
         self.begin_cell_approach()
 
 
