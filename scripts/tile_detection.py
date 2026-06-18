@@ -306,8 +306,8 @@ class detect_tiles(Node):
                 cv2.imshow(f"Warped Tile {idx}", warped_tile)
                 cv2.waitKey(1)
 
-                os.makedirs("reports", exist_ok=True)
-                report_path = f"reports/tile_cell_{idx}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                os.makedirs("tiles", exist_ok=True)
+                report_path = f"tiless/{idx}.png"
                 is_anomaly, confidence = self.predict_anomaly(warped_tile, save_path=report_path)
 
                 self.tiles['total'] += 1

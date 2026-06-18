@@ -397,28 +397,29 @@ static LeakageResult detectLeakageHorizontal(
 /*
 X JE MIRRORED, TREBA POPRAVIT (ZA VIZUALIZACIJO)
 */
-static void saveLeakingBarrelImage(const cv::Mat& rgb_image, const std::string& color_name) {
+static void saveLeakingBarrelImage(
+    const cv::Mat& rgb_image,
+    const std::string& color_name,
+    int id)
+{
     try {
-        std::filesystem::create_directories("reports");
-        
-        auto now = std::chrono::system_clock::now();
-        auto time_t_now = std::chrono::system_clock::to_time_t(now);
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-        
+        std::filesystem::create_directories("barrels");
+
         std::ostringstream oss;
-        oss << "reports/barrel_leak_"
-            << std::put_time(std::localtime(&time_t_now), "%Y%m%d_%H%M%S")
-            << "_" << std::setfill('0') << std::setw(3) << ms.count()
-            << "_" << color_name << ".png";
-        
+        oss << "barrels/" << id << ".png";
+
         std::string filename = oss.str();
+
         cv::imwrite(filename, rgb_image);
-        
+
         if (verbose) {
-            std::cerr << "Saved leaking barrel image to: " << filename << std::endl;
+            std::cerr << "Saved leaking barrel image to: "
+                      << filename << std::endl;
         }
-    } catch (const std::exception& e) {
-        std::cerr << "Error saving leaking barrel image: " << e.what() << std::endl;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error saving leaking barrel image: "
+                  << e.what() << std::endl;
     }
 }
 
@@ -814,14 +815,14 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg, const sensor_m
 
                         const bool is_leaking = leak.leaking;
 
-                        if (is_leaking) {
-                            say("Alert, Alert, warning, the barrel is leaking");
-                            saveLeakingBarrelImage(rgb_image, color_name_h);
-                        }
-
                         const SaveResult save_result_h = upsertCylinder(
                             now, point_map_h.point, color_name_h, color_stats_h, "HORIZONTAL", is_leaking);
                         const int saved_id_h = save_result_h.cylinder_id;
+
+                        if (is_leaking) {
+                            say("Alert, Alert, warning, the barrel is leaking");
+                            saveLeakingBarrelImage(rgb_image, color_name_h, saved_id_h);
+                        }
 
                         if (verbose) {
                             std::cerr << "[H] Cylinder radius: " << detected_radius_h << std::endl;
