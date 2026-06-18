@@ -540,7 +540,13 @@ class RobotExplorer(Node):
             left_right = not left_right
 
     # A more random turn approach with bias towards less visited turn angles
-    def explore_area1_random(self, speed: float = 0.2, angular_speed: float = 1.0, timeout_sec: float = 240.0, move_timeout_sec: float = 10.0) -> None:
+    def explore_area1_random(
+            self, 
+            speed: float = 0.2, 
+            angular_speed: float = 1.0, 
+            timeout_sec: float = 240.0, 
+            move_timeout_sec: float = 10.0
+            ) -> None:
         self.get_logger().info("Starting exploration of area 1...")
 
         start_time = self.get_clock().now()
@@ -574,7 +580,15 @@ class RobotExplorer(Node):
 
     # Sequentially visits a set of waypoints on a provided map
     # In area1 of task2, the robot is to avoid crossing the yellow line, so a special method is used
-    def cover_waypoints_area1_basic(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, sidestep_distance: float = 0.3, wait_time: float = 1.0, localise: bool = True) -> None:
+    def cover_waypoints_area1_basic(
+            self, 
+            waypoints: list[tuple[float, float]], 
+            turns: int = 4, 
+            angular_speed: float = 0.5, 
+            sidestep_distance: float = 0.3, 
+            wait_time: float = 1.0, 
+            localise: bool = True
+            ) -> None:
         for index, (x, y) in enumerate(waypoints):
 
             """
@@ -634,6 +648,11 @@ class RobotExplorer(Node):
                 # If an obstacle is detected, check obstacle_nearest_direction and sidestep accordingly
                 if self.obstacle_detected:
                     if self.obstacle_nearest_direction is not None:
+                        # Temporarily cancel the current goal to sidestep around the obstacle
+                        if self.goal_handle is not None:
+                            cancel_future = self.goal_handle.cancel_goal_async()
+                            rclpy.spin_until_future_complete(self, cancel_future)
+
                         # Determine a temporary goal position away from the obstacl
                         sidestep_angle = self.obstacle_nearest_direction + math.pi
 
@@ -656,14 +675,15 @@ class RobotExplorer(Node):
                     break
 
     # Visits points in area1 of task 2 by computing the cost to each unvisited point and moving to the closest one, while avoiding obstacles and the yellow line
-    def cover_waypoints_area1_optimized(self, waypoints: list[tuple[float, float]], 
-                                        turns: int = 4, 
-                                        angular_speed: float = 0.5, 
-                                        sidestep_distance: float = 0.3, 
-                                        wait_time: float = 1.0,
-                                        point_timeout_sec: float = 25.0,
-                                        localise: bool = True
-                                        ) -> None:
+    def cover_waypoints_area1_optimized(
+            self, waypoints: list[tuple[float, float]], 
+            turns: int = 4, 
+            angular_speed: float = 0.5, 
+            sidestep_distance: float = 0.3, 
+            wait_time: float = 1.0,
+            point_timeout_sec: float = 25.0,
+            localise: bool = True
+            ) -> None:
         
         current_point = waypoints[0]  
         unvisited_waypoints = waypoints.copy()
@@ -706,16 +726,31 @@ class RobotExplorer(Node):
                     break
 
                 # If a yellow line is detected ahead while moving, cancel the current goal
-                #if self.yellow_ahead and self.is_moving():                
-                #    cancel_future = self.goal_handle.cancel_goal_async()
-                #    rclpy.spin_until_future_complete(self, cancel_future)
-                #    self.turn_odom(math.pi/2, angular_speed=angular_speed)
-                #    break
+                if self.yellow_ahead and self.is_moving():  
+                    # Temporarily cancel the current goal to turn away from the yellow line              
+                    if self.goal_handle is not None:
+                        cancel_future = self.goal_handle.cancel_goal_async()
+                        rclpy.spin_until_future_complete(self, cancel_future)
+
+                    self.turn_odom(math.pi/2, angular_speed=angular_speed)
+                    
+                    # Sidestep a bit to try to get around the yellow line
+                    self.move_straight_odom(sidestep_distance)
+
+                    # Resume the original goal after sidestepping
+                    if not self.go_to_pose(x, y, yaw=0.0):
+                        self.get_logger().error(f"Failed to resume goal to ({x:.2f}, {y:.2f})")
+                        break
 
                 # If an obstacle is detected, check obstacle_nearest_direction and sidestep accordingly
                 if self.obstacle_detected:
                     if self.obstacle_nearest_direction is not None:
-                        # Determine a temporary goal position away from the obstacl
+                        # Temporarily cancel the current goal to sidestep around the obstacle
+                        if self.goal_handle is not None:
+                            cancel_future = self.goal_handle.cancel_goal_async()
+                            rclpy.spin_until_future_complete(self, cancel_future)
+
+                        # Determine a temporary goal position away from the obstacle
                         sidestep_angle = self.obstacle_nearest_direction + math.pi
 
                         # Normalise the sidestep angle to be within [-pi, pi]
@@ -759,7 +794,15 @@ class RobotExplorer(Node):
             current_point = next_point
 
     # Sequentially visits a set of waypoints on a provided map
-    def cover_waypoints_basic(self, waypoints: list[tuple[float, float]], turns: int = 4, angular_speed: float = 0.5, sidestep_distance: float = 0.3, wait_time: float = 1.0, localise: bool = True) -> None:
+    def cover_waypoints_basic(
+            self, 
+            waypoints: list[tuple[float, float]], 
+            turns: int = 4, 
+            angular_speed: float = 0.5, 
+            sidestep_distance: float = 0.3, 
+            wait_time: float = 1.0, 
+            localise: bool = True
+            ) -> None:
         for index, (x, y) in enumerate(waypoints):
 
             """
@@ -812,6 +855,11 @@ class RobotExplorer(Node):
                 # If an obstacle is detected, check obstacle_nearest_direction and sidestep accordingly
                 if self.obstacle_detected:
                     if self.obstacle_nearest_direction is not None:
+                        # Temporarily cancel the current goal to sidestep around the obstacle
+                        if self.goal_handle is not None:
+                            cancel_future = self.goal_handle.cancel_goal_async()
+                            rclpy.spin_until_future_complete(self, cancel_future)
+
                         # Determine a temporary goal position away from the obstacl
                         sidestep_angle = self.obstacle_nearest_direction + math.pi
 
@@ -1556,12 +1604,11 @@ def main(args = None):
     # TASK 2
     # For line detection run detect_yellow_line.py and arm_mover_actions.py
     # For best view of both the yellow and blue line
-    waypoints_task2_sim_area1.append(blue_line_start)
     re.cover_waypoints_area1_optimized(waypoints_task2_sim_area1, localise=False)
 
     #re.cover_waypoints_basic(waypoints_task2_sim_area1, localise=False)
 
-    #re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
+    re.go_to_pose(*blue_line_start, yaw=blue_line_start_quaternion_yaw)
 
     re.follow_blue_line()
 
