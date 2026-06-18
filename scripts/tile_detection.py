@@ -17,6 +17,7 @@ import sensor_msgs_py.point_cloud2 as pc2
 from cv_bridge import CvBridge, CvBridgeError
 import cv2
 import numpy as np
+import os
 from datetime import datetime
 import subprocess
 
@@ -26,6 +27,9 @@ from anomaly_detector import AnomalyDetector
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
+
+from rins_interfaces.msg import TilesResults
+
 
 
 class detect_tiles(Node):
@@ -64,6 +68,9 @@ class detect_tiles(Node):
 
         self.bridge = CvBridge()
         self.detector = self.load_model()
+
+        self.status_list = []
+        self.report_tile_pub = self.create_publisher(TilesResults, "/tiles_results", 10)
 
         # Subscriptions
         self.pointcloud_sub = self.create_subscription(
@@ -137,6 +144,7 @@ class detect_tiles(Node):
             self.detection_active = False
             self.get_logger().info("Tile detection deactivated")
             self.print_detected_tiles()
+            self.publish_tile_results()
             self.destroy_node()
             rclpy.shutdown()
 
@@ -144,6 +152,13 @@ class detect_tiles(Node):
         print(f"Total tiles: {self.tiles['total']}")
         print(f"Anomalous tiles: {self.tiles['anomalous']}")
         print(f"Normal tiles: {self.tiles['normal']}")
+
+    def publish_tile_results(self):
+        msg = TilesResults()
+        msg.total = self.tiles['total']
+        msg.status = self.status_list
+        self.report_tile_pub.publish(msg)
+        self.get_logger().info(f"Published TilesResults: total={msg.total}, status={msg.status}")
             
     def detect_tiles(self, image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -291,10 +306,12 @@ class detect_tiles(Node):
                 cv2.imshow(f"Warped Tile {idx}", warped_tile)
                 cv2.waitKey(1)
 
-                report_path = f"reports/tile_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{idx}.png"
+                os.makedirs("reports", exist_ok=True)
+                report_path = f"reports/tile_cell_{idx}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
                 is_anomaly, confidence = self.predict_anomaly(warped_tile, save_path=report_path)
 
                 self.tiles['total'] += 1
+                self.status_list.append('NOK' if is_anomaly else 'OK')
                 if is_anomaly:
                     self.tiles['anomalous'] += 1
                     self.say("Anomaly detected")
