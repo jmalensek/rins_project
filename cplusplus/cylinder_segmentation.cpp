@@ -36,6 +36,8 @@
 #include <sstream>
 #include <cstdlib>
 
+#include "rins_interfaces/msg/barrels_results.hpp"
+
 /*
 ZA DODAT:
 - to potem publisha na nek topic
@@ -63,6 +65,7 @@ rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr viz_image_pub;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr planes_pub;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cylinder_pub;
 rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub;
+rclcpp::Publisher<rins_interfaces::msg::BarrelsResults>::SharedPtr barrels_results_pub;
 
 std::shared_ptr<rclcpp::Node> node;
 std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
@@ -196,6 +199,37 @@ static void printSavedCylindersReport() {
                   << "\n";
     }
     std::cout << "=== End Saved Cylinders Report ===\n";
+    
+    // Compose and publish BarrelsResults message
+    if (barrels_results_pub) {
+        rins_interfaces::msg::BarrelsResults msg;
+        msg.total = saved_cylinders.size();
+        
+        for (const auto& c : saved_cylinders) {
+            msg.barve.push_back(c.color);
+            msg.orientacija.push_back(c.orientation);
+            msg.leak.push_back(c.leakage);
+        }
+        
+        barrels_results_pub->publish(msg);
+        std::cout << "Published BarrelsResults: total=" << msg.total 
+                  << " colors=[";
+        for (size_t i = 0; i < msg.barve.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << msg.barve[i];
+        }
+        std::cout << "] orientations=[";
+        for (size_t i = 0; i < msg.orientacija.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << msg.orientacija[i];
+        }
+        std::cout << "] leaks=[";
+        for (size_t i = 0; i < msg.leak.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << (msg.leak[i] ? "true" : "false");
+        }
+        std::cout << "]\n";
+    }
 }
 
 
@@ -915,6 +949,7 @@ int main(int argc, char** argv) {
     cylinder_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("cylinder_point_cloud", 1);
     marker_pub = node->create_publisher<visualization_msgs::msg::Marker>("cylinder_markers", 1);
     viz_image_pub = node->create_publisher<sensor_msgs::msg::Image>("cylinder_viz_image", 1);  // NEW
+    barrels_results_pub = node->create_publisher<rins_interfaces::msg::BarrelsResults>("barrels_results", 10);
 
 
     rclcpp::spin(node);
