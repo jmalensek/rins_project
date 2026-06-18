@@ -21,6 +21,7 @@
   <depend>message_filters</depend>
   <depend>cv_bridge</depend>
   <depend>opencv4</depend>
+  <depend>rins_interfaces</depend>
 
   <exec_depend>ament_index_python</exec_depend>
 

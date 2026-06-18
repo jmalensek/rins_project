@@ -22,6 +22,12 @@ Zamenjava za mikrofon: samo funkcijo _listen_for_task() zamenjamo z STT klicem.
 #   ros2 topic pub --once /task_input std_msgs/msg/String "{data: 'barrels'}"
 #   ros2 topic pub --once /task_input std_msgs/msg/String "{data: 'Detect anomalies in the green cell'}"
 
+# RESULTS:
+# ros2 topic pub --once /rings_results rins_interfaces/msg/RingsResults "{total: 6, barve: ['red', 'blue', 'green'], stevila: [3, 2, 1]}"
+# ros2 topic pub --once /barrels_results rins_interfaces/msg/BarrelsResults "{total: 3, barve: ['red', 'blue', 'green'], orientacija: ['vertical', 'horizontal', 'vertical'], leak: [true, false, false]}"
+# ros2 topic pub --once /tiles_results rins_interfaces/msg/TilesResults "{total: 5, status: ['OK', 'OK', 'NOK', 'OK', 'NOK']}"
+
+
 from datetime import datetime
 import json
 from pathlib import Path
@@ -56,6 +62,10 @@ from reportlab.platypus import (
     Image as RLImage, Paragraph, SimpleDocTemplate,
     Spacer, Table, TableStyle,
 )
+
+from rins_interfaces.msg import RingsResults
+from rins_interfaces.msg import BarrelsResults
+from rins_interfaces.msg import TilesResults
 
 
 TASK_KEYWORDS = {
@@ -163,6 +173,11 @@ class TaskNode(Node):
         self.create_service(Trigger, "/get_tasks", self._get_tasks_srv)
 
         self.get_logger().info("Task_manager starting.")
+
+        # SUBSCRIBE FOR RESULTS
+        self.create_subscription(RingsResults, '/rings_results', self.rings_callback, 10)
+        self.create_subscription(BarrelsResults, '/barrels_results', self.barrels_callback, 10)
+        self.create_subscription(TilesResults, '/tiles_results', self.tiles_callback, 10)
 
 
     def _kill_arecord(self):
@@ -385,7 +400,7 @@ class TaskNode(Node):
 
         # Shrani
         with self._task_memory_lock:
-            self.task_memory[task] = name
+            self.task_memory[name] = task
             self.task_results[name] = self._empty_result(task)
 
         self.task_person[task] = name
@@ -524,6 +539,14 @@ class TaskNode(Node):
         "green": 1
     }
     )"""
+    def rings_callback(self, msg):
+        person = self.task_person["Counting rings"]
+
+        self.set_rings_result(
+            person=person,
+            total=msg.total,
+            by_color=dict(zip(msg.barve, msg.stevila))
+        )
 
     """
     self.set_barrels_result(
@@ -536,6 +559,17 @@ class TaskNode(Node):
     ]
 )
     """
+    def barrels_callback(self, msg):
+        person = self.task_person["Barrels inspection"]
+
+        barrels = [{"id": i, "colour": c, "orientation": o, "leak": l} 
+           for i, (c, o, l) in enumerate(zip(msg.barve, msg.orientacija, msg.leak), start=1)]
+
+        self.set_barrels_result(
+            person=person,
+            total=msg.total,
+            barrels=barrels
+        )
 
 
     """
@@ -551,7 +585,16 @@ class TaskNode(Node):
     ]
 )
     """
+    def tiles_callback(self, msg):
+        person = self.task_person["Anomaly detection"]
 
+        tiles = [{"id": i, "status": s} for i, s in enumerate(msg.status, start=1)]
+
+        self.set_tiles_result(
+            person=person,
+            total=msg.total,
+            tiles =tiles
+        )
 
     #-------------------------------------------------
     def report(self):

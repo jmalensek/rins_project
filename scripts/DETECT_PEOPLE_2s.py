@@ -45,7 +45,7 @@ class detect_faces(Node):
 
 		self.detection_color = (0,0,255)
 		self.device = 0
-		self.max_visit_distance_m = 2.0
+		self.max_visit_distance_m = 1.5
 		self.standoff_distance = 0.65
 		self.merge_radius_m = 0.7
 		self.min_location_samples = 25
