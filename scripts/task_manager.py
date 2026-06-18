@@ -71,7 +71,8 @@ from rins_interfaces.msg import TilesResults
 TASK_KEYWORDS = {
     "Barrels inspection": ["barrel", "barrels", "cylinder", "cylinders", "inspection"],
     "Counting rings":     ["ring", "rings", "count rings", "circles"],
-    "Anomaly detection":    ["tile", "tiles", "cell", "anomaly", "anomalies"],
+    "Anomaly detection":  ["tile", "tiles", "cell", "anomaly", "anomalies"],
+    "Nothing":            ["nothing", "do nothing", "skip", "no task"]
 }
 MIN_TASK_SCORE = 0.45
 
@@ -377,7 +378,7 @@ class TaskNode(Node):
         if gender == "female":
             undecided = True
             while undecided:
-                self.say(f"You want me to perform {task}. Are you sure?")
+                self.say(f"You want me to do {task}. Are you sure?")
                 time.sleep(3)
                 raw = self.listen()
                 if raw is None:
@@ -397,6 +398,9 @@ class TaskNode(Node):
                     raw_text = raw
 
         self.get_logger().info(f"Task for {name}: {task}")
+
+        if(task == "Nothing"):
+            self.say("Understood. I will do nothing.")
 
         # Shrani
         with self._task_memory_lock:

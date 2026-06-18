@@ -143,6 +143,10 @@ class RobotExplorer(Node):
         # Publisher for visualizing a grid of markers on RViz
         self.pub_grid_marker = self.create_publisher(Marker, "/visual_grid", 10)
 
+        self.arm_mover_pub = self.create_publisher(String, '/arm_command', 10)
+
+        self.finish_pub = self.create_publisher(Bool, '/finished', 10)
+
         # Change from create_client to ActionClient
         self.compute_path_client = ActionClient(self, ComputePathToPose, 'compute_path_to_pose')
 
@@ -205,6 +209,8 @@ class RobotExplorer(Node):
             stop.header.frame_id = "base_link"
             self.cmd_vel_pub.publish(stop)
             time.sleep(0.05)
+
+        self.get_logger().info("Moved straight for {:.2f} meters".format(accumulated_distance))
     
     # AMCL-based move straight method; Very unreliable due to inaccuracy
     def move_straight_amcl(self, distance: float, speed: float = 0.2, tolerance: float = 0.02) ->None:
@@ -681,7 +687,7 @@ class RobotExplorer(Node):
             angular_speed: float = 0.5, 
             sidestep_distance: float = 0.3, 
             wait_time: float = 1.0,
-            point_timeout_sec: float = 25.0,
+            point_timeout_sec: float = 35.0,
             localise: bool = True
             ) -> None:
         
@@ -955,6 +961,13 @@ class RobotExplorer(Node):
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             contours = [c for c in contours if cv2.contourArea(c) >= min_area]
 
+            # If an obstacle is detetcted, make a u-turn
+            if self.obstacle_ahead:
+                self.get_logger().info("Obstacle detected ahead; performing U-turn.")
+                self.turn_odom(math.pi, angular_speed=max(0.2, max_angular_speed))
+                time.sleep(loop_dt)
+                continue
+
             # If no blue line is detected, increment the lost time
             if not contours:
                 lost_time += loop_dt
@@ -1040,7 +1053,10 @@ class RobotExplorer(Node):
         # First navigate to the start of the line while avoiding obstacles and the yellow line
         self.get_logger().info(f"Navigating to the start of the line at ({line_start[0]:.2f}, {line_start[1]:.2f})...")
 
-        if not self.go_to_pose(line_start[0], line_start[1], start_yaw):
+        x = line_start[0]
+        y = line_start[1]
+
+        if not self.go_to_pose(x, y, start_yaw):
             self.get_logger().error(f"Failed to navigate to the start of the line at ({line_start[0]:.2f}, {line_start[1]:.2f})")
             return
         
@@ -1672,9 +1688,19 @@ def main(args = None):
     # TASK 2
     # For line detection run detect_yellow_line.py and arm_mover_actions.py
     # For best view of both the yellow and blue line
+
+    # Set the arm position to the "look_for_qr" pose for better camera view of the yellow line
+    command = 'look_for_qr'
+    re.arm_mover_pub.publish(String(data=command))
+
     re.cover_waypoints_area1_optimized(waypoints_task2_sim_area1, localise=False)
 
     #re.cover_waypoints_basic(waypoints_task2_sim_area1, localise=False)
+
+    # Publish /finished message to indicate that the exploration is complete
+    finished_msg = Bool()
+    finished_msg.data = True
+    re.finished_pub.publish(finished_msg)
 
     re.follow_blue_line_routine(blue_line_start, start_yaw=blue_line_start_quaternion_yaw, sidestep_distance=0.3, angular_speed=0.5)
 
