@@ -120,7 +120,7 @@ class TaskNode(Node):
         self.listen = self._listen_for_task
 
         # Optional offline STT configuration (Vosk)
-        self.model_path = "/home/lea/colcon_ws/vosk-model-en-us-0.22"
+        #self.model_path = "/home/lea/colcon_ws/vosk-model-en-us-0.22"
         #self.model_path = "./src/rins_project/vosk-model-en-us-0.22"
         self.declare_parameter("mic_device_index", -1)
 
@@ -198,7 +198,7 @@ class TaskNode(Node):
         self.get_logger().info(f"{text}")
         try:
             subprocess.run(
-                ["spd-say", "-r", "-10", "-p", "-55", "-t", "male3", text],
+                ["spd-say", "-r", "-40", "-p", "-55", "-t", "male3", text],
                 check=False
             )
         except FileNotFoundError:
@@ -363,7 +363,7 @@ class TaskNode(Node):
             f"Hello {name}."
             f"What task should I perform? "
         )
-        time.sleep(3)
+        #time.sleep(3)
 
         # Poslušaj odgovor
         result = self._listen_for_categorized_task()
