@@ -89,6 +89,8 @@ class RobotExplorer(Node):
 
         self.actively_approaching = False
 
+        self.emergency_stop = False
+
         self._last_bgr = None
 
         image_qos = QoSProfile(
@@ -134,6 +136,9 @@ class RobotExplorer(Node):
 
         # Something something, approaching a person
         self.create_subscription(Bool, '/approach_active', self._approach_callback, 10)
+
+        # Emergency stop signal subscription
+        self.create_subscription(Bool, '/emergency_stop', self._emergency_stop_callback, 10)
 
         # za govor
         self.speak_pub = self.create_publisher(String, "/speak", 10)
@@ -696,6 +701,12 @@ class RobotExplorer(Node):
 
         while unvisited_waypoints:
             (x, y) = current_point
+
+            # Emergency stop check
+            while self.emergency_stop:
+                self.get_logger().warn("Emergency stop activated! Halting navigation.")
+                rclpy.spin_once(self, timeout_sec=0.1)
+                
 
             # Some new active approach interruption mechanism, that I don't fully understand
             while self.actively_approaching:
@@ -1546,6 +1557,12 @@ class RobotExplorer(Node):
             self.obstacle_nearest_direction = float(msg.data)
         except Exception:
             self.get_logger().warn('Received malformed /obstacle/nearest_direction message')
+
+    def _emergency_stop_callback(self, msg: Bool) -> None:
+        try:
+            self.emergency_stop = bool(msg.data)
+        except Exception:
+            self.get_logger().warn('Received malformed /emergency_stop message')
 
     def _image_callback(self, msg: Image) -> None:
         try:
