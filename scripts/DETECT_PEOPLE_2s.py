@@ -45,7 +45,7 @@ class detect_faces(Node):
 
 		self.detection_color = (0,0,255)
 		self.device = 0
-		self.max_visit_distance_m = 1.5
+		self.max_visit_distance_m = 2
 		self.standoff_distance = 0.65
 		self.merge_radius_m = 0.7
 		self.min_location_samples = 25
@@ -76,10 +76,10 @@ class detect_faces(Node):
 
 		# Expand the drawn bbox so it frames the whole portrait/picture, not only the face.
 		# These are multipliers of the detected face bbox size.
-		self.draw_pad_left = 1.0
-		self.draw_pad_right = 1.0
-		self.draw_pad_top = 0.7
-		self.draw_pad_bottom = 2.7
+		self.draw_pad_left = 0.5
+		self.draw_pad_right = 0.5
+		self.draw_pad_top = 0.5
+		self.draw_pad_bottom = 0.5
 
 		# Lightweight live recognition label (updated at most every N seconds)
 		self.live_recognition = True
