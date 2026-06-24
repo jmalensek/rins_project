@@ -749,7 +749,10 @@ class RobotExplorer(Node):
                         cancel_future = self.goal_handle.cancel_goal_async()
                         rclpy.spin_until_future_complete(self, cancel_future)
 
-                    self.turn_odom(math.pi/2, angular_speed=angular_speed)
+                    if np.random.rand() < 0.5:
+                        self.turn_odom(math.pi/2, angular_speed=angular_speed)
+                    else:
+                        self.turn_odom(-math.pi/2, angular_speed=angular_speed)
                     
                     # Sidestep a bit to try to get around the yellow line
                     self.move_straight_odom(sidestep_distance)
